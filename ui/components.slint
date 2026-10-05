@@ -1,0 +1,680 @@
+import { Theme, Icons } from "theme.slint";
+
+export struct CardData {
+    kind: string,
+    id: string,
+    playlist-id: string,
+    title: string,
+    subtitle: string,
+    image: image,
+    round: bool,
+    wide: bool,
+}
+
+export struct TrackData {
+    id: string,
+    title: string,
+    subtitle: string,
+    artists: string,
+    album: string,
+    duration: string,
+    image: image,
+    index: string,
+    active: bool,
+    artist-id: string,
+    album-id: string,
+}
+
+export struct ShelfData {
+    title: string,
+    // cards | list | tracks | tracklist | album
+    kind: string,
+    cards: [CardData],
+    tracks: [TrackData],
+}
+
+export struct HeaderData {
+    // "" | title | collection | artist
+    kind: string,
+    title: string,
+    line1: string,
+    line2: string,
+    description: string,
+    image: image,
+    round: bool,
+}
+
+export struct NowData {
+    id: string,
+    title: string,
+    artists: string,
+    album: string,
+    image: image,
+    art: image,
+    artist-id: string,
+    album-id: string,
+}
+
+export global Bridge {
+    callback navigate(string, string);
+    callback card-clicked(CardData);
+    callback card-play(CardData);
+    callback track-clicked(int, int);
+    callback queue-clicked(int);
+    callback artist-clicked(string);
+    callback album-clicked(string);
+    callback search(string);
+    callback search-edited(string);
+    callback back();
+    callback retry();
+    callback load-more();
+    callback play-header();
+    callback shuffle-header();
+    callback radio-header();
+    callback toggle-play();
+    callback next();
+    callback prev();
+    callback seek(float);
+    callback set-volume(float);
+    callback toggle-shuffle();
+    callback cycle-repeat();
+    callback sign-in();
+    callback sign-out();
+    callback account();
+    callback toggle-mute();
+    callback np-changed();
+    callback lyric-clicked(int);
+}
+
+export component Icon inherits Rectangle {
+    in property <string> path;
+    in property <color> tint: Theme.text;
+    in property <length> size: 24px;
+    width: size;
+    height: size;
+    Path {
+        commands: root.path;
+        fill: root.tint;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        width: 100%;
+        height: 100%;
+    }
+}
+
+// Rounded rectangle drawn as an anti-aliased path. The software renderer's
+// own border-radius edges are visibly stair-stepped on circles and outlines.
+export component Shape inherits Path {
+    in property <length> radius;
+    in property <brush> fill-color: transparent;
+    in property <brush> stroke-color: transparent;
+    in property <length> stroke-w: 0px;
+    property <float> w: max(1, self.width / 1px);
+    property <float> h: max(1, self.height / 1px);
+    property <float> i: self.stroke-w / 2px;
+    property <float> r: max(0, min(self.radius / 1px, min(w, h) / 2) - i);
+    property <float> x0: i;
+    property <float> y0: i;
+    property <float> x1: w - i;
+    property <float> y1: h - i;
+    fill: fill-color;
+    stroke: stroke-color;
+    stroke-width: stroke-w;
+    viewbox-x: 0;
+    viewbox-y: 0;
+    viewbox-width: w;
+    viewbox-height: h;
+    commands: "M " + (x0 + r) + " " + y0 + " L " + (x1 - r) + " " + y0
+        + " A " + r + " " + r + " 0 0 1 " + x1 + " " + (y0 + r)
+        + " L " + x1 + " " + (y1 - r)
+        + " A " + r + " " + r + " 0 0 1 " + (x1 - r) + " " + y1
+        + " L " + (x0 + r) + " " + y1
+        + " A " + r + " " + r + " 0 0 1 " + x0 + " " + (y1 - r)
+        + " L " + x0 + " " + (y0 + r)
+        + " A " + r + " " + r + " 0 0 1 " + (x0 + r) + " " + y0 + " Z";
+}
+
+export component IconButton inherits Rectangle {
+    in property <string> icon;
+    in property <length> size: 40px;
+    in property <length> icon-size: 24px;
+    in property <color> tint: Theme.text;
+    in property <bool> enabled: true;
+    in property <bool> bordered: false;
+    callback clicked;
+    width: size;
+    height: size;
+    Shape {
+        radius: root.size / 2;
+        fill-color: ta.pressed && root.enabled ? Theme.pressed : ta.has-hover && root.enabled ? Theme.hover : transparent;
+        stroke-color: root.bordered ? #ffffff40 : transparent;
+        stroke-w: root.bordered ? 1px : 0;
+    }
+
+    Icon {
+        path: root.icon;
+        size: root.icon-size;
+        tint: root.enabled ? root.tint : Theme.text3;
+    }
+    ta := TouchArea {
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => {
+            if root.enabled {
+                root.clicked();
+            }
+        }
+    }
+}
+
+export component PillButton inherits Rectangle {
+    in property <string> icon;
+    in property <string> text;
+    in property <bool> primary: false;
+    callback clicked;
+    height: 36px;
+    Shape {
+        radius: 18px;
+        fill-color: root.primary ? (ta.has-hover ? #e0e0e0 : #ffffff) : (ta.has-hover ? Theme.hover : transparent);
+        stroke-color: root.primary ? transparent : #ffffff40;
+        stroke-w: root.primary ? 0 : 1px;
+    }
+
+    HorizontalLayout {
+        padding-left: root.icon != "" ? 12px : 16px;
+        padding-right: 16px;
+        spacing: 8px;
+        alignment: center;
+        if root.icon != "": VerticalLayout {
+            alignment: center;
+            Icon {
+                path: root.icon;
+                size: 22px;
+                tint: root.primary ? #030303 : Theme.text;
+            }
+        }
+        Text {
+            text: root.text;
+            color: root.primary ? #030303 : Theme.text;
+            font-size: 14px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+export component Seekbar inherits Rectangle {
+    in property <float> value;
+    in property <color> fill: Theme.accent;
+    in property <bool> always-knob: false;
+    // Report the value continuously while dragging (volume), not just on release.
+    in property <bool> live: false;
+    callback seek(float);
+    property <bool> dragging;
+    property <float> drag-value;
+    property <float> shown: dragging ? drag-value : clamp(value, 0, 1);
+    property <bool> active: ta.has-hover || dragging;
+    height: 16px;
+    Rectangle {
+        y: (parent.height - self.height) / 2;
+        height: root.active ? 4px : 2px;
+        width: 100%;
+        background: #ffffff33;
+    }
+
+    Rectangle {
+        x: 0;
+        y: (parent.height - self.height) / 2;
+        height: root.active ? 4px : 2px;
+        width: parent.width * root.shown;
+        background: root.fill;
+    }
+
+    if root.active || root.always-knob: Shape {
+        x: parent.width * root.shown - 6px;
+        y: (parent.height - 12px) / 2;
+        width: 12px;
+        height: 12px;
+        radius: 6px;
+        fill-color: root.fill;
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        pointer-event(e) => {
+            if e.kind == PointerEventKind.down && e.button == PointerEventButton.left {
+                root.dragging = true;
+                root.drag-value = clamp(self.mouse-x / self.width, 0, 1);
+                if root.live {
+                    root.seek(root.drag-value);
+                }
+            } else if e.kind == PointerEventKind.up && root.dragging {
+                root.dragging = false;
+                root.seek(root.drag-value);
+            }
+        }
+        moved => {
+            if root.dragging {
+                root.drag-value = clamp(self.mouse-x / self.width, 0, 1);
+                if root.live {
+                    root.seek(root.drag-value);
+                }
+            }
+        }
+    }
+}
+
+// Multi-line text clamped to `lines` lines (Text's own elide does not clip
+// wrapped text, so the overflow is clipped here).
+export component ClampText inherits Rectangle {
+    in property <string> text;
+    in property <color> tint: Theme.text;
+    in property <length> font-size: 14px;
+    in property <int> font-weight: 400;
+    in property <int> lines: 2;
+    in property <TextHorizontalAlignment> align: left;
+    property <length> line: root.font-size * 1.34;
+    height: min(t.preferred-height, root.lines * root.line);
+    clip: true;
+    t := Text {
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        text: root.text;
+        color: root.tint;
+        font-size: root.font-size;
+        font-weight: root.font-weight;
+        wrap: word-wrap;
+        overflow: elide;
+        horizontal-alignment: root.align;
+    }
+}
+
+export component Card inherits Rectangle {
+    in property <CardData> data;
+    in property <length> size: Theme.card;
+    property <length> art-w: data.wide ? size * 16 / 9 : size;
+    property <bool> on-play: ta.has-hover && !data.round && ta.mouse-x > art-w - 56px && ta.mouse-x < art-w - 8px && ta.mouse-y > size - 56px && ta.mouse-y < size - 8px;
+    width: art-w;
+    height: size + 92px;
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: root.art-w;
+        height: root.size;
+        border-radius: root.data.round ? root.size / 2 : 4px;
+        clip: true;
+        background: Theme.placeholder;
+        Image {
+            source: root.data.image;
+            width: parent.width;
+            height: parent.height;
+            image-fit: cover;
+        }
+
+        if ta.has-hover && !root.data.round: Rectangle {
+            background: #00000059;
+            Rectangle {
+                x: parent.width - 52px;
+                y: parent.height - 52px;
+                width: 40px;
+                height: 40px;
+                Shape {
+                    radius: 20px;
+                    fill-color: root.on-play ? #000000f0 : #000000b3;
+                }
+
+                Icon {
+                    path: Icons.play;
+                    size: 26px;
+                }
+            }
+        }
+    }
+
+    VerticalLayout {
+        x: 0;
+        y: root.size + 10px;
+        width: root.art-w;
+        height: 82px;
+        alignment: start;
+        spacing: 2px;
+        ClampText {
+            text: root.data.title;
+            font-size: 15px;
+            font-weight: 600;
+            align: root.data.round ? center : left;
+        }
+
+        ClampText {
+            text: root.data.subtitle;
+            tint: Theme.text2;
+            align: root.data.round ? center : left;
+        }
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            if root.on-play {
+                Bridge.card-play(root.data);
+            } else {
+                Bridge.card-clicked(root.data);
+            }
+        }
+    }
+}
+
+component Thumb inherits Rectangle {
+    in property <image> source;
+    in property <bool> active;
+    in property <bool> hover;
+    width: 40px;
+    height: 40px;
+    border-radius: 2px;
+    clip: true;
+    background: Theme.placeholder;
+    Image {
+        source: root.source;
+        width: parent.width;
+        height: parent.height;
+        image-fit: cover;
+    }
+
+    if root.hover || root.active: Rectangle {
+        background: #00000099;
+        Icon {
+            path: root.active && !root.hover ? Icons.radio : Icons.play;
+            size: 24px;
+        }
+    }
+}
+
+export component LinkText inherits Text {
+    callback clicked;
+    in property <bool> link: true;
+    color: lta.has-hover && link ? Theme.text : Theme.text2;
+    lta := TouchArea {
+        mouse-cursor: root.link ? pointer : default;
+        clicked => {
+            if root.link {
+                root.clicked();
+            }
+        }
+    }
+}
+
+// columns: playlist style (title | artists | album | time); numbered: album style.
+export component TrackRow inherits Rectangle {
+    in property <TrackData> data;
+    in property <bool> columns: false;
+    in property <bool> numbered: false;
+    callback clicked;
+    height: 56px;
+    border-radius: 4px;
+    background: ta.has-hover ? Theme.hover : transparent;
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 16px;
+        spacing: 16px;
+        if root.numbered && !root.data.active && !ta.has-hover: Text {
+            width: 32px;
+            text: root.data.index;
+            color: Theme.text2;
+            font-size: 15px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        if root.numbered && (root.data.active || ta.has-hover): HorizontalLayout {
+            width: 32px;
+            alignment: center;
+            VerticalLayout {
+                alignment: center;
+                Icon {
+                    path: root.data.active && !ta.has-hover ? Icons.radio : Icons.play;
+                    size: 22px;
+                }
+            }
+        }
+        if !root.numbered: VerticalLayout {
+            alignment: center;
+            Thumb {
+                source: root.data.image;
+                active: root.data.active;
+                hover: ta.has-hover;
+            }
+        }
+        if !root.columns: VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            spacing: 2px;
+            Text {
+                text: root.data.title;
+                color: Theme.text;
+                font-size: 15px;
+                font-weight: 500;
+                overflow: elide;
+            }
+
+            Text {
+                text: root.data.subtitle;
+                color: Theme.text2;
+                font-size: 14px;
+                overflow: elide;
+            }
+        }
+        if root.columns: Text {
+            horizontal-stretch: 3;
+            min-width: 120px;
+            preferred-width: 0;
+            text: root.data.title;
+            color: Theme.text;
+            font-size: 15px;
+            font-weight: 500;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+        if root.columns && root.data.artists != "": LinkText {
+            horizontal-stretch: 2;
+            min-width: 80px;
+            preferred-width: 0;
+            text: root.data.artists;
+            font-size: 15px;
+            overflow: elide;
+            vertical-alignment: center;
+            link: root.data.artist-id != "";
+            clicked => {
+                Bridge.artist-clicked(root.data.artist-id);
+            }
+        }
+        if root.columns && !root.numbered: LinkText {
+            horizontal-stretch: 2;
+            min-width: 80px;
+            preferred-width: 0;
+            text: root.data.album;
+            font-size: 15px;
+            overflow: elide;
+            vertical-alignment: center;
+            link: root.data.album-id != "";
+            clicked => {
+                Bridge.album-clicked(root.data.album-id);
+            }
+        }
+        Text {
+            width: 48px;
+            text: root.data.duration;
+            color: Theme.text2;
+            font-size: 14px;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component ShelfTitle inherits HorizontalLayout {
+    in property <string> title;
+    in property <bool> arrows;
+    in property <bool> can-left;
+    in property <bool> can-right;
+    callback left();
+    callback right();
+    height: 48px;
+    spacing: 12px;
+    Text {
+        horizontal-stretch: 1;
+        text: root.title;
+        color: Theme.text;
+        font-size: 26px;
+        font-weight: 700;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    VerticalLayout {
+        alignment: center;
+        IconButton {
+            icon: Icons.chevron-left;
+            size: 36px;
+            bordered: true;
+            opacity: root.arrows ? 1 : 0;
+            enabled: root.arrows && root.can-left;
+            clicked => {
+                root.left();
+            }
+        }
+    }
+
+    VerticalLayout {
+        alignment: center;
+        IconButton {
+            icon: Icons.chevron-right;
+            size: 36px;
+            bordered: true;
+            opacity: root.arrows ? 1 : 0;
+            enabled: root.arrows && root.can-right;
+            clicked => {
+                root.right();
+            }
+        }
+    }
+}
+
+export component CardShelf inherits VerticalLayout {
+    in property <ShelfData> shelf;
+    spacing: 12px;
+    ShelfTitle {
+        title: root.shelf.title;
+        arrows: flick.content-width > flick.width;
+        can-left: flick.content-x < 0;
+        can-right: flick.content-x > flick.width - flick.content-width + 1px;
+        left => {
+            flick.content-x = min(0px, flick.content-x + flick.width * 0.8);
+        }
+        right => {
+            flick.content-x = max(flick.width - flick.content-width, flick.content-x - flick.width * 0.8);
+        }
+    }
+
+    flick := Flickable {
+        height: Theme.card + 92px;
+        content-width: row.preferred-width;
+        interactive: false;
+        animate content-x {
+            duration: 280ms;
+            easing: ease-in-out;
+        }
+        row := HorizontalLayout {
+            spacing: 24px;
+            alignment: start;
+            for c in root.shelf.cards: Card {
+                data: c;
+            }
+        }
+    }
+}
+
+// "Quick picks" style: 4 rows per column, scrolls horizontally.
+export component ListShelf inherits VerticalLayout {
+    in property <ShelfData> shelf;
+    in property <int> index;
+    property <length> col-w: 400px;
+    spacing: 12px;
+    ShelfTitle {
+        title: root.shelf.title;
+        arrows: flick.content-width > flick.width;
+        can-left: flick.content-x < 0;
+        can-right: flick.content-x > flick.width - flick.content-width + 1px;
+        left => {
+            flick.content-x = min(0px, flick.content-x + flick.width * 0.8);
+        }
+        right => {
+            flick.content-x = max(flick.width - flick.content-width, flick.content-x - flick.width * 0.8);
+        }
+    }
+
+    flick := Flickable {
+        height: 4 * 56px;
+        content-width: ceil(root.shelf.tracks.length / 4) * (root.col-w + 16px);
+        interactive: false;
+        animate content-x {
+            duration: 280ms;
+            easing: ease-in-out;
+        }
+        for t[i] in root.shelf.tracks: TrackRow {
+            x: floor(i / 4) * (root.col-w + 16px);
+            y: mod(i, 4) * 56px;
+            width: root.col-w;
+            data: t;
+            clicked => {
+                Bridge.track-clicked(root.index, i);
+            }
+        }
+    }
+}
+
+export component TrackShelf inherits VerticalLayout {
+    in property <ShelfData> shelf;
+    in property <int> index;
+    alignment: start;
+    if root.shelf.title != "": ShelfTitle {
+        title: root.shelf.title;
+    }
+    for t[i] in root.shelf.tracks: TrackRow {
+        data: t;
+        columns: root.shelf.kind != "tracks";
+        numbered: root.shelf.kind == "album";
+        clicked => {
+            Bridge.track-clicked(root.index, i);
+        }
+    }
+}
+
+export component ShelfList inherits VerticalLayout {
+    in property <[ShelfData]> shelves;
+    spacing: 40px;
+    alignment: start;
+    for s[i] in root.shelves: VerticalLayout {
+        if s.kind == "cards": CardShelf {
+            shelf: s;
+        }
+        if s.kind == "list": ListShelf {
+            shelf: s;
+            index: i;
+        }
+        if s.kind == "tracks" || s.kind == "tracklist" || s.kind == "album": TrackShelf {
+            shelf: s;
+            index: i;
+        }
+    }
+}

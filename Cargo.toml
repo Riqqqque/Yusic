@@ -1,0 +1,52 @@
+[package]
+name = "yusic"
+version = "0.1.0"
+edition = "2024"
+authors = ["Rique"]
+description = "Lightweight native YouTube Music client for Windows"
+
+[dependencies]
+anyhow = "1.0.104"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+raw-window-handle = "0.6"
+reqwest = { version = "0.12", default-features = false, features = ["default-tls", "json"] }
+rustypipe = { version = "0.11.4", features = ["userdata"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1_smol = "1.0.1"
+slint = { version = "1.18", default-features = false, features = ["std", "backend-winit", "renderer-software", "compat-1-2", "raw-window-handle-06"] }
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "process", "fs", "sync", "time"] }
+tray-icon = "0.26"
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Media",
+    "Media_Control",
+    "Media_Core",
+    "Media_Playback",
+    "Storage",
+    "Storage_Streams",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_System_LibraryLoader",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+wry = { version = "0.57", default-features = false }
+
+[build-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }
+slint-build = "1.18"
+winresource = "0.1.31"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev.package."*"]
+opt-level = 2

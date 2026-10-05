@@ -1,0 +1,1193 @@
+import { ScrollView, Spinner } from "std-widgets.slint";
+import { Theme, Icons } from "theme.slint";
+import {
+    CardData, TrackData, ShelfData, HeaderData, NowData, Bridge,
+    Icon, IconButton, PillButton, Seekbar, TrackRow, LinkText, ShelfList, ClampText, Shape,
+} from "components.slint";
+
+export { Bridge, CardData, TrackData, ShelfData, HeaderData, NowData }
+
+component NavItem inherits Rectangle {
+    in property <string> icon;
+    in property <string> label;
+    in property <bool> selected;
+    in property <bool> wide;
+    callback clicked;
+    height: wide ? 48px : 64px;
+    Shape {
+        radius: 8px;
+        fill-color: root.selected ? Theme.raised : (ta.has-hover ? #ffffff0d : transparent);
+    }
+
+    if root.wide: HorizontalLayout {
+        padding-left: 16px;
+        spacing: 22px;
+        VerticalLayout {
+            alignment: center;
+            Icon {
+                path: root.icon;
+            }
+        }
+        Text {
+            text: root.label;
+            font-size: 16px;
+            font-weight: 500;
+            color: Theme.text;
+            vertical-alignment: center;
+        }
+    }
+    if !root.wide: VerticalLayout {
+        alignment: center;
+        spacing: 4px;
+        HorizontalLayout {
+            alignment: center;
+            Icon {
+                path: root.icon;
+            }
+        }
+        Text {
+            text: root.label;
+            font-size: 10px;
+            color: Theme.text;
+            horizontal-alignment: center;
+        }
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+component SideItem inherits Rectangle {
+    in property <CardData> data;
+    height: 52px;
+    Shape {
+        radius: 8px;
+        fill-color: ta.has-hover ? #ffffff0d : transparent;
+    }
+
+    VerticalLayout {
+        padding-left: 16px;
+        padding-right: 12px;
+        alignment: center;
+        spacing: 2px;
+        Text {
+            text: root.data.title;
+            color: Theme.text;
+            font-size: 14px;
+            font-weight: 500;
+            overflow: elide;
+        }
+
+        Text {
+            text: root.data.subtitle;
+            color: Theme.text2;
+            font-size: 12px;
+            overflow: elide;
+        }
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            Bridge.navigate("playlist", root.data.id);
+        }
+    }
+}
+
+component Logo inherits HorizontalLayout {
+    Text {
+        text: "Yusic";
+        color: Theme.text;
+        font-size: 22px;
+        font-weight: 700;
+        letter-spacing: -0.5px;
+        vertical-alignment: center;
+    }
+}
+
+component CollectionHeader inherits VerticalLayout {
+    in property <HeaderData> header;
+    spacing: 12px;
+    alignment: start;
+    HorizontalLayout {
+        alignment: center;
+        Rectangle {
+            width: 264px;
+            height: 264px;
+            border-radius: root.header.round ? 132px : 8px;
+            clip: true;
+            background: Theme.placeholder;
+            Image {
+                source: root.header.image;
+                width: parent.width;
+                height: parent.height;
+                image-fit: cover;
+            }
+        }
+    }
+
+    Rectangle {
+        height: 8px;
+    }
+
+    Text {
+        text: root.header.title;
+        color: Theme.text;
+        font-size: 30px;
+        font-weight: 700;
+        wrap: word-wrap;
+        horizontal-alignment: center;
+    }
+
+    Text {
+        text: root.header.line1;
+        color: Theme.text2;
+        font-size: 15px;
+        wrap: word-wrap;
+        horizontal-alignment: center;
+    }
+
+    Text {
+        text: root.header.line2;
+        color: Theme.text2;
+        font-size: 14px;
+        wrap: word-wrap;
+        horizontal-alignment: center;
+    }
+
+    if root.header.description != "": ClampText {
+        text: root.header.description;
+        tint: Theme.text2;
+        lines: 3;
+        align: center;
+    }
+    HorizontalLayout {
+        alignment: center;
+        spacing: 12px;
+        padding-top: 8px;
+        IconButton {
+            icon: Icons.shuffle;
+            size: 44px;
+            bordered: true;
+            clicked => {
+                Bridge.shuffle-header();
+            }
+        }
+
+        Rectangle {
+            width: 64px;
+            height: 64px;
+            Shape {
+                radius: 32px;
+                fill-color: pta.has-hover ? #e0e0e0 : #ffffff;
+            }
+
+            Icon {
+                path: Icons.play;
+                size: 40px;
+                tint: #030303;
+            }
+
+            pta := TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    Bridge.play-header();
+                }
+            }
+        }
+
+        IconButton {
+            icon: Icons.radio;
+            size: 44px;
+            bordered: true;
+            clicked => {
+                Bridge.radio-header();
+            }
+        }
+    }
+}
+
+component ArtistHeader inherits Rectangle {
+    in property <HeaderData> header;
+    height: 420px;
+    clip: true;
+    Image {
+        source: root.header.image;
+        width: parent.width;
+        height: parent.height;
+        image-fit: cover;
+    }
+
+    Rectangle {
+        background: @linear-gradient(180deg, #03030333 0%, #03030366 45%, #030303 100%);
+    }
+
+    VerticalLayout {
+        padding-left: 48px;
+        padding-right: 48px;
+        padding-bottom: 32px;
+        spacing: 16px;
+        alignment: end;
+        Text {
+            text: root.header.title;
+            color: Theme.text;
+            font-size: 52px;
+            font-weight: 800;
+            overflow: elide;
+        }
+
+        if root.header.description != "": ClampText {
+            text: root.header.description;
+            tint: Theme.text2;
+            lines: 3;
+            max-width: 760px;
+        }
+        HorizontalLayout {
+            alignment: start;
+            spacing: 12px;
+            PillButton {
+                icon: Icons.shuffle;
+                text: "Shuffle";
+                primary: true;
+                clicked => {
+                    Bridge.shuffle-header();
+                }
+            }
+
+            PillButton {
+                icon: Icons.radio;
+                text: "Radio";
+                clicked => {
+                    Bridge.radio-header();
+                }
+            }
+        }
+    }
+}
+
+component NpTab inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected;
+    callback clicked;
+    Text {
+        text: root.label;
+        color: root.selected ? Theme.text : Theme.text3;
+        font-size: 14px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    if root.selected: Rectangle {
+        y: parent.height - 2px;
+        height: 2px;
+        background: Theme.text;
+    }
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+component LyricsView inherits Rectangle {
+    in property <[string]> lines;
+    in property <int> active: -1;
+    in property <bool> synced;
+    in property <string> source;
+    property <length> target;
+    fl := Flickable {
+        content-height: col.preferred-height;
+        animate content-y {
+            duration: 350ms;
+            easing: ease-out;
+        }
+        col := VerticalLayout {
+            width: fl.width;
+            padding-top: 16px;
+            padding-bottom: root.synced ? 320px : 24px;
+            padding-right: 16px;
+            spacing: 14px;
+            alignment: start;
+            for line[i] in root.lines: Rectangle {
+                property <bool> is-active: root.synced && i == root.active;
+                height: t.preferred-height;
+                t := Text {
+                    width: parent.width;
+                    text: line == "" ? "\u{266A}" : line;
+                    wrap: word-wrap;
+                    font-size: 20px;
+                    font-weight: 700;
+                    color: !root.synced ? Theme.text : self.is-active-line ? Theme.text : (i < root.active ? Theme.text3 : Theme.text2);
+                    property <bool> is-active-line: parent.is-active;
+                }
+
+                changed is-active => {
+                    if self.is-active {
+                        root.target = self.y;
+                    }
+                }
+                if root.synced: TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        Bridge.lyric-clicked(i);
+                    }
+                }
+            }
+            if root.source != "": Text {
+                text: root.source;
+                color: Theme.text3;
+                font-size: 12px;
+            }
+        }
+    }
+
+    // Keep the current line a third of the way down the panel.
+    changed target => {
+        fl.content-y = -max(0px, min(root.target - fl.height * 0.33, col.preferred-height - fl.height));
+    }
+}
+
+component NowPlayingView inherits Rectangle {
+    in property <NowData> now;
+    in property <[TrackData]> queue;
+    in-out property <int> tab;
+    in property <[string]> lyrics-lines;
+    in property <int> lyrics-active;
+    in property <bool> lyrics-synced;
+    in property <string> lyrics-state;
+    in property <string> lyrics-source;
+    background: Theme.bg;
+    TouchArea { }
+
+    HorizontalLayout {
+        padding: 48px;
+        padding-top: 24px;
+        spacing: 48px;
+        Rectangle {
+            horizontal-stretch: 1;
+            Rectangle {
+                width: min(parent.width, parent.height);
+                height: self.width;
+                border-radius: 8px;
+                clip: true;
+                background: Theme.placeholder;
+                Image {
+                    source: root.now.art;
+                    width: parent.width;
+                    height: parent.height;
+                    image-fit: cover;
+                }
+            }
+        }
+
+        VerticalLayout {
+            width: 460px;
+            spacing: 0;
+            HorizontalLayout {
+                height: 48px;
+                NpTab {
+                    label: "UP NEXT";
+                    selected: root.tab == 0;
+                    clicked => {
+                        root.tab = 0;
+                    }
+                }
+
+                NpTab {
+                    label: "LYRICS";
+                    selected: root.tab == 1;
+                    clicked => {
+                        root.tab = 1;
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 1px;
+                background: Theme.divider;
+            }
+
+            Rectangle {
+                height: 8px;
+            }
+
+            if root.tab == 0: ScrollView {
+                VerticalLayout {
+                    alignment: start;
+                    for t[i] in root.queue: TrackRow {
+                        data: t;
+                        clicked => {
+                            Bridge.queue-clicked(i);
+                        }
+                    }
+                }
+            }
+            if root.tab == 1 && root.lyrics-state == "ready": LyricsView {
+                lines: root.lyrics-lines;
+                active: root.lyrics-active;
+                synced: root.lyrics-synced;
+                source: root.lyrics-source;
+            }
+            if root.tab == 1 && root.lyrics-state == "loading": HorizontalLayout {
+                alignment: center;
+                padding-top: 48px;
+                VerticalLayout {
+                    alignment: start;
+                    Spinner {
+                        indeterminate: true;
+                        width: 36px;
+                        height: 36px;
+                    }
+                }
+            }
+            if root.tab == 1 && (root.lyrics-state == "none" || root.lyrics-state == "error" || root.lyrics-state == ""): VerticalLayout {
+                alignment: start;
+                padding-top: 48px;
+                Text {
+                    text: root.lyrics-state == "error" ? "Couldn't load lyrics. Check your connection and try again." : root.lyrics-state == "" ? "Nothing is playing." : "Lyrics aren't available for this song.";
+                    color: Theme.text2;
+                    font-size: 15px;
+                    wrap: word-wrap;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+    }
+}
+
+component PlayerBar inherits Rectangle {
+    in property <NowData> now;
+    in property <bool> playing;
+    in property <bool> buffering;
+    in property <float> progress;
+    in property <string> time-text;
+    in property <float> volume;
+    in property <bool> shuffle;
+    in property <int> repeat-mode;
+    in-out property <bool> np-open;
+    background: Theme.surface;
+    height: Theme.playerbar;
+    TouchArea {
+        clicked => {
+            root.np-open = !root.np-open;
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 16px;
+        spacing: 8px;
+        HorizontalLayout {
+            width: 280px;
+            alignment: start;
+            spacing: 4px;
+            VerticalLayout {
+                alignment: center;
+                IconButton {
+                    icon: Icons.prev;
+                    clicked => {
+                        Bridge.prev();
+                    }
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                if root.buffering: Rectangle {
+                    width: 48px;
+                    height: 48px;
+                    Spinner {
+                        indeterminate: true;
+                        width: 30px;
+                        height: 30px;
+                    }
+                }
+                if !root.buffering: IconButton {
+                    icon: root.playing ? Icons.pause : Icons.play;
+                    size: 48px;
+                    icon-size: 38px;
+                    clicked => {
+                        Bridge.toggle-play();
+                    }
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                IconButton {
+                    icon: Icons.next;
+                    clicked => {
+                        Bridge.next();
+                    }
+                }
+            }
+
+            Text {
+                text: root.time-text;
+                color: Theme.text2;
+                font-size: 12px;
+                vertical-alignment: center;
+            }
+        }
+
+        HorizontalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            spacing: 16px;
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 40px;
+                    height: 40px;
+                    border-radius: 2px;
+                    clip: true;
+                    background: Theme.placeholder;
+                    Image {
+                        source: root.now.image;
+                        width: parent.width;
+                        height: parent.height;
+                        image-fit: cover;
+                    }
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                max-width: 520px;
+                spacing: 2px;
+                Text {
+                    text: root.now.title;
+                    color: Theme.text;
+                    font-size: 15px;
+                    font-weight: 600;
+                    overflow: elide;
+                }
+
+                HorizontalLayout {
+                    spacing: 0;
+                    LinkText {
+                        text: root.now.artists;
+                        font-size: 14px;
+                        overflow: elide;
+                        link: root.now.artist-id != "";
+                        clicked => {
+                            Bridge.artist-clicked(root.now.artist-id);
+                        }
+                    }
+
+                    if root.now.album != "": Text {
+                        text: " • ";
+                        color: Theme.text2;
+                        font-size: 14px;
+                    }
+                    if root.now.album != "": LinkText {
+                        text: root.now.album;
+                        font-size: 14px;
+                        overflow: elide;
+                        link: root.now.album-id != "";
+                        clicked => {
+                            Bridge.album-clicked(root.now.album-id);
+                        }
+                    }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            width: 280px;
+            alignment: end;
+            spacing: 4px;
+            VerticalLayout {
+                alignment: center;
+                IconButton {
+                    icon: root.volume <= 0.001 ? Icons.volume-off : Icons.volume;
+                    tint: Theme.text2;
+                    clicked => {
+                        Bridge.toggle-mute();
+                    }
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                Seekbar {
+                    width: 88px;
+                    value: root.volume;
+                    fill: Theme.text;
+                    always-knob: true;
+                    live: true;
+                    seek(v) => {
+                        Bridge.set-volume(v);
+                    }
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                IconButton {
+                    icon: root.repeat-mode == 2 ? Icons.repeat-one : Icons.repeat;
+                    tint: root.repeat-mode == 0 ? Theme.text3 : Theme.text;
+                    clicked => {
+                        Bridge.cycle-repeat();
+                    }
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                IconButton {
+                    icon: Icons.shuffle;
+                    tint: root.shuffle ? Theme.text : Theme.text3;
+                    clicked => {
+                        Bridge.toggle-shuffle();
+                    }
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                IconButton {
+                    icon: root.np-open ? Icons.drop-down : Icons.drop-up;
+                    clicked => {
+                        root.np-open = !root.np-open;
+                    }
+                }
+            }
+        }
+    }
+
+    Seekbar {
+        x: 0;
+        y: -8px;
+        width: parent.width;
+        value: root.progress;
+        seek(v) => {
+            Bridge.seek(v);
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    in property <image> app-icon;
+    title: "Yusic";
+    icon: app-icon;
+    background: Theme.bg;
+    default-font-family: Theme.font;
+    preferred-width: 1280px;
+    preferred-height: 820px;
+    min-width: 760px;
+    min-height: 480px;
+
+    // navigation / page
+    in-out property <string> section: "home";
+    in property <HeaderData> header;
+    in property <[ShelfData]> shelves;
+    in property <bool> loading;
+    in property <string> error;
+    in property <string> notice;
+    in property <bool> can-back;
+    in-out property <length> scroll-y;
+    in-out property <bool> sidebar-wide: true;
+
+    // search
+    in-out property <string> search-text;
+    in property <[string]> suggestions;
+    in-out property <bool> search-open;
+
+    // player
+    in property <bool> has-track;
+    in property <NowData> now;
+    in property <bool> playing;
+    in property <bool> buffering;
+    in property <float> progress;
+    in property <string> time-text;
+    in property <float> volume: 1.0;
+    in property <bool> shuffle;
+    in property <int> repeat-mode;
+    in property <[TrackData]> queue;
+    in-out property <bool> np-open;
+
+    // account
+    in property <bool> signed-in;
+    in property <[CardData]> side-playlists;
+    in-out property <bool> account-open;
+    in property <string> toast;
+
+    // lyrics (Now Playing panel, tab 1)
+    in-out property <int> np-tab: 0;
+    in property <[string]> lyrics-lines;
+    in property <int> lyrics-active: -1;
+    in property <bool> lyrics-synced;
+    in property <string> lyrics-state;
+    in property <string> lyrics-source;
+
+    changed np-open => {
+        Bridge.np-changed();
+    }
+    changed np-tab => {
+        Bridge.np-changed();
+    }
+
+    property <length> side-w: sidebar-wide ? Theme.sidebar-wide : Theme.sidebar-narrow;
+
+    VerticalLayout {
+        // top bar
+        HorizontalLayout {
+            height: Theme.topbar;
+            padding-left: 16px;
+            padding-right: 24px;
+            spacing: 16px;
+            HorizontalLayout {
+                width: root.side-w - 16px;
+                spacing: 12px;
+                VerticalLayout {
+                    alignment: center;
+                    IconButton {
+                        icon: Icons.menu;
+                        clicked => {
+                            root.sidebar-wide = !root.sidebar-wide;
+                        }
+                    }
+                }
+
+                if root.sidebar-wide: Logo { }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                IconButton {
+                    icon: Icons.back;
+                    enabled: root.can-back;
+                    clicked => {
+                        Bridge.back();
+                    }
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 1;
+                min-width: 160px;
+                max-width: 480px;
+                search-box := Rectangle {
+                    height: 40px;
+                    Shape {
+                        radius: 8px;
+                        fill-color: input.has-focus ? #ffffff26 : #ffffff1a;
+                        stroke-color: input.has-focus ? #ffffff40 : #ffffff14;
+                        stroke-w: 1px;
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 4px;
+                        spacing: 12px;
+                        VerticalLayout {
+                            alignment: center;
+                            Icon {
+                                path: Icons.search;
+                                tint: Theme.text2;
+                            }
+                        }
+
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            input := TextInput {
+                                text <=> root.search-text;
+                                color: Theme.text;
+                                font-size: 16px;
+                                vertical-alignment: center;
+                                single-line: true;
+                                selection-background-color: #3ea6ff66;
+                                edited => {
+                                    root.search-open = true;
+                                    Bridge.search-edited(self.text);
+                                }
+                                accepted => {
+                                    root.search-open = false;
+                                    Bridge.search(self.text);
+                                    self.clear-focus();
+                                }
+                            }
+
+                            if root.search-text == "": Text {
+                                x: 0;
+                                text: "Search songs, albums, artists, podcasts";
+                                color: Theme.text3;
+                                font-size: 16px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+
+                        if root.search-text != "": VerticalLayout {
+                            alignment: center;
+                            IconButton {
+                                icon: Icons.close;
+                                size: 32px;
+                                icon-size: 20px;
+                                clicked => {
+                                    root.search-text = "";
+                                    root.search-open = false;
+                                    input.focus();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                horizontal-stretch: 0.6;
+            }
+
+            VerticalLayout {
+                alignment: center;
+                account-btn := IconButton {
+                    icon: Icons.account;
+                    tint: root.signed-in ? Theme.text : Theme.text2;
+                    clicked => {
+                        Bridge.account();
+                    }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            vertical-stretch: 1;
+            // sidebar
+            VerticalLayout {
+                width: root.side-w;
+                padding-left: 8px;
+                padding-right: 8px;
+                spacing: 4px;
+                NavItem {
+                    icon: Icons.home;
+                    label: "Home";
+                    wide: root.sidebar-wide;
+                    selected: root.section == "home";
+                    clicked => {
+                        Bridge.navigate("home", "");
+                    }
+                }
+
+                NavItem {
+                    icon: Icons.explore;
+                    label: "Explore";
+                    wide: root.sidebar-wide;
+                    selected: root.section == "explore";
+                    clicked => {
+                        Bridge.navigate("explore", "");
+                    }
+                }
+
+                NavItem {
+                    icon: Icons.library;
+                    label: "Library";
+                    wide: root.sidebar-wide;
+                    selected: root.section == "library";
+                    clicked => {
+                        Bridge.navigate("library", "");
+                    }
+                }
+
+                if root.sidebar-wide: Rectangle {
+                    height: 1px;
+                    background: Theme.divider;
+                }
+                if root.sidebar-wide && !root.signed-in: VerticalLayout {
+                    padding: 16px;
+                    spacing: 16px;
+                    Text {
+                        text: "Sign in to create & share playlists, get personalized recommendations, and more.";
+                        color: Theme.text;
+                        font-size: 14px;
+                        wrap: word-wrap;
+                    }
+
+                    HorizontalLayout {
+                        alignment: start;
+                        PillButton {
+                            text: "Sign in";
+                            clicked => {
+                                Bridge.sign-in();
+                            }
+                        }
+                    }
+                }
+                if root.sidebar-wide && root.signed-in: ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        alignment: start;
+                        padding-top: 8px;
+                        for p in root.side-playlists: SideItem {
+                            data: p;
+                        }
+                    }
+                }
+                if !root.sidebar-wide || !root.signed-in: Rectangle {
+                    vertical-stretch: 1;
+                }
+            }
+
+            // page
+            Rectangle {
+                horizontal-stretch: 1;
+                sv := ScrollView {
+                    content-y <=> root.scroll-y;
+                    content-width: self.visible-width;
+                    content-height: content.preferred-height;
+                    content := VerticalLayout {
+                        width: sv.visible-width;
+                        alignment: start;
+                        padding-bottom: 48px;
+                        if root.header.kind == "artist": ArtistHeader {
+                            header: root.header;
+                        }
+                        if root.header.kind == "collection": HorizontalLayout {
+                            padding-left: 32px;
+                            padding-right: 40px;
+                            padding-top: 24px;
+                            spacing: 40px;
+                            CollectionHeader {
+                                width: min(400px, sv.visible-width * 0.36);
+                                header: root.header;
+                            }
+
+                            VerticalLayout {
+                                alignment: start;
+                                horizontal-stretch: 1;
+                                ShelfList {
+                                    shelves: root.shelves;
+                                }
+                            }
+                        }
+                        if root.header.kind != "collection": VerticalLayout {
+                            padding-left: 40px;
+                            padding-right: 40px;
+                            padding-top: 16px;
+                            spacing: 16px;
+                            alignment: start;
+                            if root.header.kind == "title": Text {
+                                text: root.header.title;
+                                color: Theme.text;
+                                font-size: 34px;
+                                font-weight: 700;
+                            }
+                            ShelfList {
+                                shelves: root.shelves;
+                            }
+                        }
+                        if root.notice != "": VerticalLayout {
+                            padding: 64px;
+                            Text {
+                                text: root.notice;
+                                color: Theme.text2;
+                                font-size: 16px;
+                                wrap: word-wrap;
+                                horizontal-alignment: center;
+                            }
+                        }
+                        if root.error != "": VerticalLayout {
+                            padding: 64px;
+                            spacing: 16px;
+                            alignment: center;
+                            Text {
+                                text: root.error;
+                                color: Theme.text2;
+                                font-size: 16px;
+                                wrap: word-wrap;
+                                horizontal-alignment: center;
+                            }
+
+                            HorizontalLayout {
+                                alignment: center;
+                                PillButton {
+                                    text: "Retry";
+                                    clicked => {
+                                        Bridge.retry();
+                                    }
+                                }
+                            }
+                        }
+                        if root.loading: HorizontalLayout {
+                            padding: 48px;
+                            alignment: center;
+                            Spinner {
+                                indeterminate: true;
+                                width: 40px;
+                                height: 40px;
+                            }
+                        }
+                    }
+
+                    changed content-y => {
+                        if !root.loading && (-self.content-y + self.visible-height > self.content-height - 900px) {
+                            Bridge.load-more();
+                        }
+                    }
+                    // Pages shorter than the window never scroll; fetch more right away.
+                    changed content-height => {
+                        if !root.loading && self.content-height < self.visible-height + 900px {
+                            Bridge.load-more();
+                        }
+                    }
+                }
+
+                if root.np-open: NowPlayingView {
+                    now: root.now;
+                    queue: root.queue;
+                    tab <=> root.np-tab;
+                    lyrics-lines: root.lyrics-lines;
+                    lyrics-active: root.lyrics-active;
+                    lyrics-synced: root.lyrics-synced;
+                    lyrics-state: root.lyrics-state;
+                    lyrics-source: root.lyrics-source;
+                }
+            }
+        }
+
+        if root.has-track: PlayerBar {
+            now: root.now;
+            playing: root.playing;
+            buffering: root.buffering;
+            progress: root.progress;
+            time-text: root.time-text;
+            volume: root.volume;
+            shuffle: root.shuffle;
+            repeat-mode: root.repeat-mode;
+            np-open <=> root.np-open;
+        }
+    }
+
+    // account menu
+    if root.account-open: TouchArea {
+        clicked => {
+            root.account-open = false;
+        }
+    }
+    if root.account-open: Rectangle {
+        x: account-btn.absolute-position.x + account-btn.width - self.width;
+        y: account-btn.absolute-position.y + account-btn.height + 6px;
+        width: 220px;
+        height: menu.preferred-height;
+        Shape {
+            radius: 10px;
+            fill-color: #282828;
+            stroke-color: #ffffff1a;
+            stroke-w: 1px;
+        }
+
+        menu := VerticalLayout {
+            padding: 8px;
+            Rectangle {
+                height: 44px;
+                Shape {
+                    radius: 6px;
+                    fill-color: so.has-hover ? Theme.hover : transparent;
+                }
+
+                HorizontalLayout {
+                    padding-left: 12px;
+                    spacing: 12px;
+                    Text {
+                        text: "Sign out";
+                        color: Theme.text;
+                        font-size: 15px;
+                        vertical-alignment: center;
+                    }
+                }
+
+                so := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        root.account-open = false;
+                        Bridge.sign-out();
+                    }
+                }
+            }
+        }
+    }
+
+    // transient message
+    if root.toast != "": Rectangle {
+        x: (root.width - self.width) / 2;
+        y: root.height - (root.has-track ? Theme.playerbar : 0px) - self.height - 24px;
+        width: min(toast-text.preferred-width + 40px, root.width - 80px);
+        height: max(44px, toast-text.preferred-height + 20px);
+        Shape {
+            radius: 8px;
+            fill-color: #323232;
+        }
+
+        toast-text := Text {
+            x: 20px;
+            width: parent.width - 40px;
+            text: root.toast;
+            color: Theme.text;
+            font-size: 14px;
+            wrap: word-wrap;
+            vertical-alignment: center;
+        }
+    }
+
+    // search suggestions dropdown
+    if root.search-open && root.suggestions.length > 0: TouchArea {
+        clicked => {
+            root.search-open = false;
+        }
+    }
+    if root.search-open && root.suggestions.length > 0: Rectangle {
+        x: search-box.absolute-position.x;
+        y: search-box.absolute-position.y + search-box.height + 4px;
+        width: search-box.width;
+        height: list.preferred-height;
+        background: #212121;
+        border-radius: 8px;
+        drop-shadow-blur: 12px;
+        drop-shadow-color: #000000a0;
+        list := VerticalLayout {
+            padding-top: 8px;
+            padding-bottom: 8px;
+            for s in root.suggestions: Rectangle {
+                height: 44px;
+                background: sta.has-hover ? Theme.hover : transparent;
+                HorizontalLayout {
+                    padding-left: 16px;
+                    spacing: 16px;
+                    VerticalLayout {
+                        alignment: center;
+                        Icon {
+                            path: Icons.search;
+                            size: 20px;
+                            tint: Theme.text2;
+                        }
+                    }
+
+                    Text {
+                        text: s;
+                        color: Theme.text;
+                        font-size: 15px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+
+                sta := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        root.search-text = s;
+                        root.search-open = false;
+                        input.clear-focus();
+                        Bridge.search(s);
+                    }
+                }
+            }
+        }
+    }
+}
