@@ -71,7 +71,7 @@ thread_local! {
 
 pub fn init(http: reqwest::Client, rt: tokio::runtime::Handle) {
     LOADER.with(|l| {
-        *l.borrow_mut() = Some(Loader { http, rt, limit: Arc::new(Semaphore::new(6)) });
+        *l.borrow_mut() = Some(Loader { http, rt, limit: Arc::new(Semaphore::new(16)) });
     });
 }
 

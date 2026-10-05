@@ -6,11 +6,17 @@ A lightweight native YouTube Music client for Windows, written in Rust.
 - Data: [rustypipe](https://crates.io/crates/rustypipe) for albums, artists, playlists, search and radio. Home and Explore use a small InnerTube browse parser (`src/yt/browse.rs`).
 - Audio: [yt-dlp](https://github.com/yt-dlp/yt-dlp) resolves the stream, Yusic downloads it, and `Windows.Media.Playback.MediaPlayer` plays it. Media keys and the Windows media flyout work through the player's built-in SMTC integration.
 
-## Requirements
+## Install
 
-- Windows 10/11
-- Node.js on `PATH` (yt-dlp needs a JavaScript runtime for YouTube)
-- `yt-dlp.exe`, placed next to `yusic.exe`, in a `tools\` folder beside it, or on `PATH`. In this checkout it lives in `tools\yt-dlp.exe`, which is gitignored. Update it with `tools\yt-dlp.exe -U`.
+1. Download **[Yusic.exe](https://github.com/Riqqqque/Yusic/releases/latest/download/Yusic.exe)** from the latest release.
+2. Run it and choose **Yes** to install. It installs for your Windows account (no admin needed) and adds Start menu and desktop shortcuts.
+3. On first start, Yusic downloads the tools it needs to play music: [yt-dlp](https://github.com/yt-dlp/yt-dlp), plus the [Deno](https://deno.com) JavaScript runtime if Node.js isn't installed. Checksums are verified.
+
+Yusic updates itself from GitHub releases, and yt-dlp is updated daily. To uninstall, use **Settings > Apps > Installed apps > Yusic**.
+
+Windows SmartScreen may warn the first time because the exe isn't code-signed. Choose **More info > Run anyway**. Each release lists the SHA-256 of `Yusic.exe` if you want to check it.
+
+Requires Windows 10 or 11. Signing in uses the WebView2 runtime, which comes with Windows 11.
 
 ## Build and run
 
@@ -18,6 +24,14 @@ A lightweight native YouTube Music client for Windows, written in Rust.
 cargo build --release
 target\release\yusic.exe
 ```
+
+Development builds look for `yt-dlp.exe` in `tools\` (gitignored) and use Node.js from `PATH`.
+
+`scriptselease.ps1 -Version x.y.z` builds the public exe (with local paths removed from the binary) and publishes it as a GitHub release.
+
+Development builds look for `yt-dlp.exe` in `tools\` (gitignored) and use Node.js from `PATH`.
+
+`scripts\release.ps1 -Version x.y.z` builds the public exe (with local paths removed from the binary) and publishes it as a GitHub release.
 
 `scripts\deploy.ps1` builds and installs `dist\yusic.exe`, which the desktop shortcut runs. It doesn't interrupt a running copy: the old exe is renamed aside, keeps playing, and gets cleaned up on a later start.
 
@@ -48,5 +62,7 @@ Closing the window hides Yusic to the tray, and playback continues. Quit from th
 
 - YouTube's DASH audio is fragmented MP4. When a file carries an edit list, Media Foundation jumps to the end of the track, so the resolver neutralizes the `edts` box after download (see `disable_fragmented_edit_list`).
 - rustypipe's combined search mis-parses song rows, so songs and videos come from the filtered searches.
+- Audio: the best format available is chosen, in this order: 256 kbps Opus/AAC (YouTube Music Premium, when signed in), ~160 kbps Opus, then 128 kbps AAC. If Windows can't decode a file, that track is fetched again as AAC.
+- Lyrics: time-synced lyrics come from [LRCLIB](https://lrclib.net), with YouTube Music's own lyrics as a fallback. Covers and re-uploads get the original song's words without the timing.
 - Likes and playlist editing are not implemented yet.
 - The app icon is drawn in code (`src/icon_raster.rs`). `build.rs` turns it into the `.ico` embedded in the exe.

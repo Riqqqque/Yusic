@@ -19,7 +19,7 @@ use crate::images;
 use crate::login;
 use crate::model::{Continuation, Header, Item, Kind, Page, Shelf, ShelfKind, fmt_duration};
 use crate::player::{Meta, Player, PlayerEvent};
-use crate::resolver::Resolver;
+use crate::resolver::{Quality, Resolver};
 use crate::settings::Settings;
 use crate::yt::Yt;
 use crate::yt::lyrics::{self, LyricsBody};
@@ -110,6 +110,11 @@ struct State {
     last_volume: f32,
 
     signed_in: bool,
+    /// Recently shown pages, for instant back/revisits.
+    page_cache: Vec<(Route, Instant, Page)>,
+    /// Tracks whose best-quality file Windows couldn't decode; these use the
+    /// compatible (AAC) format instead.
+    compat: HashSet<String>,
     /// Video id whose lyrics are shown or loading.
     lyrics_for: Option<String>,
     /// Line start times (ms) when the lyrics are synced.
@@ -121,7 +126,28 @@ struct State {
     rng: u64,
 }
 
+const PAGE_CACHE_SIZE: usize = 12;
+const PAGE_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+
 impl State {
+    fn cache_page(&mut self, route: Route, page: Page) {
+        if page.shelves.is_empty() && matches!(page.header, Header::None) {
+            return;
+        }
+        self.page_cache.retain(|c| c.0 != route);
+        self.page_cache.push((route, Instant::now(), page));
+        if self.page_cache.len() > PAGE_CACHE_SIZE {
+            self.page_cache.remove(0);
+        }
+    }
+
+    fn cached_page(&self, route: &Route) -> Option<Page> {
+        self.page_cache
+            .iter()
+            .find(|c| &c.0 == route && c.1.elapsed() < PAGE_CACHE_TTL)
+            .map(|c| c.2.clone())
+    }
+
     /// Cancels downloads for tracks that are no longer current or next.
     fn prune_downloads(&mut self, keep: &[&str]) {
         self.downloads.retain(|(id, h)| {
@@ -288,7 +314,7 @@ impl App {
         b.on_retry(with(|a| {
             let route = a.st.borrow().route.clone();
             if let Some(r) = route {
-                a.navigate(r, false);
+                a.open(r, false, false);
             }
         }));
         b.on_load_more(with(|a| a.load_more()));
@@ -323,6 +349,13 @@ impl App {
         b.on_sign_in(with(|a| a.sign_in()));
         b.on_sign_out(with(|a| a.sign_out()));
         b.on_np_changed(with(|a| a.np_changed()));
+        b.on_restart_update(with(|a| {
+            if let Err(e) = crate::install::spawn_restart() {
+                a.toast(format!("Couldn't restart: {e:#}"));
+                return;
+            }
+            let _ = slint::quit_event_loop();
+        }));
         b.on_lyric_clicked(|i| {
             if let Some(a) = app() {
                 a.lyric_clicked(i);
@@ -352,6 +385,10 @@ impl App {
             .abort_handle()
     }
 
+    pub fn notify(&self, msg: String) {
+        self.toast(msg);
+    }
+
     fn toast(&self, msg: impl Into<SharedString>) {
         let tok = {
             let mut st = self.st.borrow_mut();
@@ -371,8 +408,18 @@ impl App {
     // ---------------------------------------------------------------- pages
 
     pub fn navigate(self: &Rc<Self>, route: Route, push: bool) {
-        let (tok, can_back) = {
+        self.open(route, push, true);
+    }
+
+    /// Loads `route`, from the page cache when allowed and fresh.
+    fn open(self: &Rc<Self>, route: Route, push: bool, use_cache: bool) {
+        let (tok, can_back, cached) = {
             let mut st = self.st.borrow_mut();
+            // Remember the page we're leaving, including anything loaded since.
+            if let Some(leaving) = st.route.clone() {
+                let page = std::mem::take(&mut st.page);
+                st.cache_page(leaving, page);
+            }
             if push {
                 if let Some(cur) = st.route.take() {
                     if cur != route {
@@ -389,7 +436,8 @@ impl App {
             st.shelf_models.clear();
             st.shelves_model = None;
             st.loading_more = false;
-            (st.page_gen, !st.history.is_empty())
+            let cached = if use_cache { st.cached_page(&route) } else { None };
+            (st.page_gen, !st.history.is_empty(), cached)
         };
         let ui = self.ui();
         ui.set_section(route.section().into());
@@ -404,6 +452,11 @@ impl App {
         ui.set_account_open(false);
         if let Route::Search(q) = &route {
             ui.set_search_text(q.into());
+        }
+        if let Some(page) = cached {
+            ui.set_loading(true);
+            self.show_page(tok, Ok(page));
+            return;
         }
         ui.set_loading(true);
         let yt = self.yt.clone();
@@ -427,7 +480,7 @@ impl App {
     fn reload_if(self: &Rc<Self>, routes: &[Route]) {
         let route = self.st.borrow().route.clone();
         if let Some(r) = route.filter(|r| routes.contains(r)) {
-            self.navigate(r, false);
+            self.open(r, false, false);
         }
     }
 
@@ -911,8 +964,9 @@ impl App {
         let res = self.res.clone();
         let id = item.id.clone();
         let cookie = self.yt.cookie();
+        let quality = self.quality_for(&id);
         let handle = self.spawn(
-            async move { res.ensure(&id, cookie).await.map_err(|e| format!("{e:#}")) },
+            async move { res.ensure(&id, cookie, quality).await.map_err(|e| format!("{e:#}")) },
             move |app, r| app.file_ready(tok, item, r),
         );
         let id = self.current_id().unwrap_or_default();
@@ -934,7 +988,7 @@ impl App {
         let thumb = images::sized_url(&item.thumb, 300, 300);
         let meta = Meta { title: &item.title, artist: &artists, album: &album, thumb: &thumb };
         if let Err(e) = self.player.load(&path, &meta) {
-            return self.track_failed(tok, &item.title, &e.to_string());
+            return self.decode_failed(tok, &item.title, &e.to_string());
         }
         {
             let mut st = self.st.borrow_mut();
@@ -942,6 +996,30 @@ impl App {
             st.loaded_at = Some(Instant::now());
         }
         self.prefetch_next();
+    }
+
+    fn quality_for(&self, id: &str) -> Quality {
+        if self.st.borrow().compat.contains(id) { Quality::Compatible } else { Quality::Best }
+    }
+
+    /// Windows couldn't play the downloaded file: fetch the track once more in
+    /// the compatible format before giving up on it.
+    fn decode_failed(self: &Rc<Self>, tok: u64, title: &str, err: &str) {
+        let retry = {
+            let mut st = self.st.borrow_mut();
+            match st.current().map(|i| i.id.clone()) {
+                Some(id) if st.play_gen == tok && !st.compat.contains(&id) => {
+                    st.compat.insert(id);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if retry {
+            self.start_current();
+        } else {
+            self.track_failed(tok, title, err);
+        }
     }
 
     /// Shows why a track can't play and moves on, unless several in a row failed.
@@ -1000,9 +1078,10 @@ impl App {
         }
         let res = self.res.clone();
         let cookie = self.yt.cookie();
+        let quality = if st.compat.contains(&next) { Quality::Compatible } else { Quality::Best };
         let id = next.clone();
         let h = self.rt.spawn(async move {
-            let _ = res.ensure(&id, cookie).await;
+            let _ = res.ensure(&id, cookie, quality).await;
         });
         st.downloads.push((next, h.abort_handle()));
     }
@@ -1150,7 +1229,7 @@ impl App {
                 }
                 if instant {
                     // "Ended" right after loading means the file wasn't playable.
-                    self.track_failed(tok, &title, "the file could not be decoded");
+                    self.decode_failed(tok, &title, "the file could not be decoded");
                 } else {
                     self.st.borrow_mut().fail_streak = 0;
                     self.advance(true);
@@ -1164,7 +1243,7 @@ impl App {
                     (st.has_source, st.play_gen, st.current().map(|i| i.title.clone()).unwrap_or_default())
                 };
                 if has_source {
-                    self.track_failed(tok, &title, &msg);
+                    self.decode_failed(tok, &title, &msg);
                 }
             }
         }
@@ -1338,7 +1417,12 @@ impl App {
     }
 
     fn set_signed_in(self: &Rc<Self>, on: bool) {
-        self.st.borrow_mut().signed_in = on;
+        {
+            let mut st = self.st.borrow_mut();
+            st.signed_in = on;
+            // Pages differ when signed in (personal Home, Library, private playlists).
+            st.page_cache.clear();
+        }
         self.ui().set_signed_in(on);
         if !on {
             self.sidebar_model.set_vec(Vec::new());

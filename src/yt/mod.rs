@@ -175,7 +175,7 @@ impl Yt {
     }
 
     pub async fn home(&self) -> Result<Page> {
-        self.browse_page("FEmusic_home", 1).await
+        self.browse_page("FEmusic_home", 0).await
     }
 
     pub async fn explore(&self) -> Result<Page> {

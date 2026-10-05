@@ -19,7 +19,35 @@ use tokio::sync::{OnceCell, Semaphore};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const CHUNK: u64 = 10 << 20;
-const FORMAT: &str = "140/bestaudio[ext=m4a]";
+/// Best audio first: 256 kbps Opus/AAC (YouTube Music Premium, needs the
+/// signed-in session), then ~160 kbps Opus, then 128 kbps AAC.
+const FORMAT_BEST: &str = "774/141/251/140/bestaudio[ext=webm]/bestaudio[ext=m4a]";
+/// 128 kbps AAC: decodes on every Windows install.
+const FORMAT_COMPAT: &str = "140/bestaudio[ext=m4a]";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Quality {
+    Best,
+    /// Retry format for a file Windows could not decode.
+    Compatible,
+}
+
+impl Quality {
+    fn format(self) -> &'static str {
+        match self {
+            Quality::Best => FORMAT_BEST,
+            Quality::Compatible => FORMAT_COMPAT,
+        }
+    }
+
+    /// Cache file stem: `<id>` or `<id>~c`.
+    fn stem(self, id: &str) -> String {
+        match self {
+            Quality::Best => id.to_owned(),
+            Quality::Compatible => format!("{id}~c"),
+        }
+    }
+}
 const YTDLP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
 #[derive(Deserialize)]
@@ -27,11 +55,14 @@ struct Resolved {
     url: String,
     filesize: Option<u64>,
     #[serde(default)]
+    ext: String,
+    #[serde(default)]
     http_headers: HashMap<String, String>,
 }
 
 pub struct Resolver {
-    ytdlp: PathBuf,
+    /// yt-dlp and its JS runtime; None until setup has found or installed them.
+    tools: std::sync::RwLock<Option<crate::tools::Tools>>,
     dir: PathBuf,
     data_dir: PathBuf,
     ytdlp_cache: PathBuf,
@@ -42,13 +73,13 @@ pub struct Resolver {
 }
 
 impl Resolver {
-    pub fn new(ytdlp: PathBuf, data_dir: &Path, http: reqwest::Client) -> Result<Self> {
+    pub fn new(tools: Option<crate::tools::Tools>, data_dir: &Path, http: reqwest::Client) -> Result<Self> {
         let dir = data_dir.join("cache");
         let ytdlp_cache = data_dir.join("yt-dlp");
         std::fs::create_dir_all(&dir)?;
         std::fs::create_dir_all(&ytdlp_cache)?;
         let r = Self {
-            ytdlp,
+            tools: std::sync::RwLock::new(tools),
             dir,
             data_dir: data_dir.to_owned(),
             ytdlp_cache,
@@ -72,28 +103,27 @@ impl Resolver {
         Ok(r)
     }
 
-    /// Looks for yt-dlp next to the exe, in `tools/`, then on PATH.
-    pub fn find_ytdlp() -> Option<PathBuf> {
-        let mut candidates = Vec::new();
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                candidates.push(dir.join("yt-dlp.exe"));
-                candidates.push(dir.join("tools").join("yt-dlp.exe"));
-            }
-        }
-        candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("tools").join("yt-dlp.exe"));
-        if let Some(found) = candidates.into_iter().find(|p| p.is_file()) {
-            return Some(found);
-        }
-        std::env::var_os("PATH").and_then(|paths| {
-            std::env::split_paths(&paths)
-                .map(|p| p.join("yt-dlp.exe"))
-                .find(|p| p.is_file())
-        })
+    pub fn set_tools(&self, tools: crate::tools::Tools) {
+        *self.tools.write().unwrap() = Some(tools);
     }
 
-    fn file_for(&self, id: &str) -> PathBuf {
-        self.dir.join(format!("{id}.m4a"))
+    pub fn has_tools(&self) -> bool {
+        self.tools.read().unwrap().is_some()
+    }
+
+    /// Updates yt-dlp while no download is using it.
+    pub async fn update_ytdlp(&self) -> bool {
+        let Some(ytdlp) = self.tools.read().unwrap().as_ref().map(|t| t.ytdlp.clone()) else { return false };
+        let Ok(_all) = self.procs.acquire_many(2).await else { return false };
+        crate::tools::update_ytdlp(&ytdlp, &self.data_dir).await
+    }
+
+    /// An already downloaded file for this stem, whatever its format.
+    fn existing(&self, stem: &str) -> Option<PathBuf> {
+        ["webm", "m4a", "opus", "mp4"]
+            .iter()
+            .map(|ext| self.dir.join(format!("{stem}.{ext}")))
+            .find(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > 0))
     }
 
     /// Sets the tracks whose files must stay on disk and deletes the rest.
@@ -111,7 +141,9 @@ impl Resolver {
         for e in rd.flatten() {
             let path = e.path();
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-            if keep.contains(stem) || busy.contains(stem) {
+            // "<id>~c" is the compatible-format copy of <id>.
+            let id = stem.split('~').next().unwrap_or(stem);
+            if keep.contains(id) || busy.contains(stem) {
                 continue;
             }
             let _ = std::fs::remove_file(&path);
@@ -121,12 +153,13 @@ impl Resolver {
     /// Returns a playable local file, resolving and downloading if needed.
     /// Concurrent calls for the same id share one download; dropping the
     /// future cancels it (and kills yt-dlp) unless another caller still waits.
-    pub async fn ensure(&self, id: &str, cookie: Option<String>) -> Result<PathBuf> {
+    pub async fn ensure(&self, id: &str, cookie: Option<String>, quality: Quality) -> Result<PathBuf> {
+        let stem = quality.stem(id);
         let cell = self
             .inflight
             .lock()
             .unwrap()
-            .entry(id.to_owned())
+            .entry(stem.clone())
             .or_default()
             .clone();
         // Removes the in-flight entry when the last waiter finishes or is cancelled.
@@ -145,8 +178,8 @@ impl Resolver {
                 }
             }
         }
-        let done = Done { map: &self.inflight, id, cell };
-        let res = done.cell.get_or_try_init(|| self.fetch(id, cookie)).await.cloned();
+        let done = Done { map: &self.inflight, id: &stem, cell };
+        let res = done.cell.get_or_try_init(|| self.fetch(id, &stem, cookie, quality)).await.cloned();
         drop(done);
         // Finished after the user moved on: don't leave it lying around.
         // The lock is held so a concurrent retain() can't re-add the id in between.
@@ -161,47 +194,52 @@ impl Resolver {
         res
     }
 
-    async fn fetch(&self, id: &str, cookie: Option<String>) -> Result<PathBuf> {
-        let path = self.file_for(id);
-        if std::fs::metadata(&path).is_ok_and(|m| m.len() > 0) {
+    async fn fetch(&self, id: &str, stem: &str, cookie: Option<String>, quality: Quality) -> Result<PathBuf> {
+        if let Some(path) = self.existing(stem) {
             let _ = disable_fragmented_edit_list(&path);
             return Ok(path);
         }
-        let resolved = match self.resolve(id, None).await {
-            Ok(r) => r,
-            // Private, uploaded or age-restricted tracks need the account.
-            Err(e) => match &cookie {
-                Some(c) => self.resolve(id, Some(c)).await.map_err(|_| e)?,
-                None => return Err(e),
+        // Signed in: ask with the account first, which also unlocks Premium's
+        // 256 kbps formats and private/uploaded tracks; fall back to anonymous.
+        let resolved = match &cookie {
+            Some(c) => match self.resolve(id, Some(c), quality).await {
+                Ok(r) => r,
+                Err(_) => self.resolve(id, None, quality).await?,
             },
+            None => self.resolve(id, None, quality).await?,
         };
-        if let Err(e) = self.download(&resolved, &path).await {
-            self.ytdlp_download(id, &path, cookie.as_deref())
+        let ext = match resolved.ext.as_str() {
+            "webm" | "m4a" | "opus" | "mp4" => resolved.ext.clone(),
+            _ => "m4a".to_owned(),
+        };
+        let path = self.dir.join(format!("{stem}.{ext}"));
+        let path = match self.download(&resolved, &path).await {
+            Ok(()) => path,
+            Err(e) => self
+                .ytdlp_download(id, stem, cookie.as_deref(), quality)
                 .await
-                .with_context(|| format!("direct download failed ({e:#})"))?;
-        }
+                .with_context(|| format!("direct download failed ({e:#})"))?,
+        };
         disable_fragmented_edit_list(&path)?;
         Ok(path)
     }
 
-    fn command(&self) -> tokio::process::Command {
-        let mut c = tokio::process::Command::new(&self.ytdlp);
-        c.args([
-            "--ignore-config",
-            "--js-runtimes",
-            "node",
-            "--no-warnings",
-            "--no-playlist",
-            "--no-progress",
-            "-f",
-            FORMAT,
-            "--cache-dir",
-        ])
-        .arg(&self.ytdlp_cache)
+    fn command(&self, quality: Quality) -> Result<tokio::process::Command> {
+        let tools = self
+            .tools
+            .read()
+            .unwrap()
+            .clone()
+            .context("Yusic is still downloading its playback components. Try again in a moment.")?;
+        let mut c = tokio::process::Command::new(&tools.ytdlp);
+        c.args(["--ignore-config", "--js-runtimes"])
+            .arg(&tools.js_runtime)
+            .args(["--no-warnings", "--no-playlist", "--no-progress", "-f", quality.format(), "--cache-dir"])
+            .arg(&self.ytdlp_cache)
         .creation_flags(CREATE_NO_WINDOW)
         .kill_on_drop(true)
         .stdin(std::process::Stdio::null());
-        c
+        Ok(c)
     }
 
     /// Writes a short-lived cookies.txt for yt-dlp; deleted when dropped.
@@ -215,9 +253,9 @@ impl Resolver {
         Ok(TempFile(path))
     }
 
-    async fn resolve(&self, id: &str, cookie: Option<&str>) -> Result<Resolved> {
+    async fn resolve(&self, id: &str, cookie: Option<&str>, quality: Quality) -> Result<Resolved> {
         let _permit = self.procs.acquire().await?;
-        let mut cmd = self.command();
+        let mut cmd = self.command(quality)?;
         let _cookies = match cookie {
             Some(c) => {
                 let f = self.cookie_file(c)?;
@@ -228,7 +266,7 @@ impl Resolver {
         };
         let out = tokio::time::timeout(
             YTDLP_TIMEOUT,
-            cmd.args(["--print", "%(.{url,filesize,http_headers})j"]).arg(watch_url(id)).output(),
+            cmd.args(["--print", "%(.{url,filesize,http_headers,ext})j"]).arg(watch_url(id)).output(),
         )
         .await
         .map_err(|_| anyhow::anyhow!("yt-dlp timed out"))?
@@ -299,9 +337,10 @@ impl Resolver {
         Ok(n)
     }
 
-    async fn ytdlp_download(&self, id: &str, path: &Path, cookie: Option<&str>) -> Result<()> {
+    /// Lets yt-dlp download the file itself; returns where it put it.
+    async fn ytdlp_download(&self, id: &str, stem: &str, cookie: Option<&str>, quality: Quality) -> Result<PathBuf> {
         let _permit = self.procs.acquire().await?;
-        let mut cmd = self.command();
+        let mut cmd = self.command(quality)?;
         let _cookies = match cookie {
             Some(c) => {
                 let f = self.cookie_file(c)?;
@@ -312,15 +351,18 @@ impl Resolver {
         };
         let out = tokio::time::timeout(
             YTDLP_TIMEOUT * 4,
-            cmd.args(["--force-overwrites", "-o"]).arg(path).arg(watch_url(id)).output(),
+            cmd.args(["--force-overwrites", "-o"])
+                .arg(self.dir.join(format!("{stem}.%(ext)s")))
+                .arg(watch_url(id))
+                .output(),
         )
         .await
         .map_err(|_| anyhow::anyhow!("yt-dlp timed out"))?
         .context("could not start yt-dlp")?;
-        if !out.status.success() || !path.is_file() {
-            bail!(ytdlp_error(&out.stderr));
+        match self.existing(stem) {
+            Some(p) if out.status.success() => Ok(p),
+            _ => bail!(ytdlp_error(&out.stderr)),
         }
-        Ok(())
     }
 }
 

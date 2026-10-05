@@ -1,16 +1,18 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
 mod auth;
 mod icon;
 mod icon_raster;
 mod images;
+mod install;
 mod login;
 mod model;
 mod player;
 mod resolver;
 mod settings;
 mod single;
+mod tools;
 mod tray;
 mod win;
 mod yt;
@@ -40,6 +42,8 @@ struct Args {
     volume: Option<f32>,
     sign_in: bool,
     lyrics: bool,
+    uninstall: bool,
+    wait_for: Option<u32>,
 }
 
 impl Args {
@@ -57,6 +61,8 @@ impl Args {
                 "--volume" => a.volume = it.next().and_then(|v| v.parse().ok()),
                 "--sign-in" => a.sign_in = true,
                 "--lyrics" => a.lyrics = true,
+                "--uninstall" => a.uninstall = true,
+                "--wait-for" => a.wait_for = it.next().and_then(|p| p.parse().ok()),
                 _ => {}
             }
         }
@@ -97,8 +103,19 @@ fn remove_old_copies() {
 
 fn run() -> Result<()> {
     let args = Args::parse();
+    if let Some(pid) = args.wait_for {
+        // Restarting after an update: let the old instance finish exiting.
+        install::wait_for_process(pid);
+    }
     remove_old_copies();
+    if args.uninstall {
+        install::uninstall(&data_dir());
+        return Ok(());
+    }
     let testing = args.snapshot.is_some() || args.exit_after.is_some();
+    if !testing && install::maybe_install()? {
+        return Ok(());
+    }
     let save_settings = !testing && args.volume.is_none();
     let instance = if testing {
         None
@@ -126,21 +143,19 @@ fn run() -> Result<()> {
         .read_timeout(Duration::from_secs(30))
         .build()?;
 
-    let ytdlp = Resolver::find_ytdlp()
-        .context("yt-dlp.exe was not found. Place it next to yusic.exe (or in a 'tools' folder beside it).")?;
-    let res = Arc::new(Resolver::new(ytdlp, &dir, http.clone())?);
+    let res = Arc::new(Resolver::new(tools::find(&dir), &dir, http.clone())?);
     let yt = Arc::new(Yt::new(&dir, http.clone())?);
     // A sign-in window from a previous run may have left its browser profile.
     login::clear_profile(&dir);
 
     let ui = AppWindow::new()?;
-    images::init(http, rt.handle().clone());
+    images::init(http.clone(), rt.handle().clone());
     ui.set_app_icon(icon::slint_image(64));
     if settings.width >= 400 && settings.height >= 300 {
         ui.window().set_size(PhysicalSize::new(settings.width, settings.height));
     }
 
-    let app = App::install(&ui, rt.handle().clone(), yt, res, dir.clone(), settings)?;
+    let app = App::install(&ui, rt.handle().clone(), yt, res.clone(), dir.clone(), settings)?;
     if let Some(v) = args.volume {
         app.set_volume(v);
     }
@@ -172,6 +187,8 @@ fn run() -> Result<()> {
         }
     }
     app.restore_session();
+    start_background_jobs(&rt, &res, &dir, &http, testing);
+    let update_watch = watch_for_new_version(&ui);
 
     // The native window (and with it the real display scale) only exists once
     // the event loop runs; load the first page after that so images are
@@ -253,8 +270,81 @@ fn run() -> Result<()> {
         std::thread::sleep(Duration::from_millis(200));
     }
     drop(tray);
+    drop(update_watch);
     rt.shutdown_timeout(Duration::from_millis(300));
     Ok(())
+}
+
+fn notify(msg: String) {
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(a) = app::app() {
+            a.notify(msg);
+        }
+    });
+}
+
+/// Downloads missing playback tools, keeps yt-dlp current (daily) and, for
+/// installed copies, checks GitHub for app updates (every 6 hours).
+fn start_background_jobs(rt: &tokio::runtime::Runtime, res: &Arc<Resolver>, dir: &std::path::Path, http: &reqwest::Client, testing: bool) {
+    if !res.has_tools() {
+        let (res, dir, http) = (res.clone(), dir.to_owned(), http.clone());
+        rt.spawn(async move {
+            notify("Setting up playbackâ€¦".into());
+            match tools::install(&dir, &http, notify).await {
+                Ok(t) => {
+                    res.set_tools(t);
+                    notify("Ready to play".into());
+                }
+                Err(e) => notify(format!("Couldn't download playback components ({e:#}). Yusic will retry on the next start.")),
+            }
+        });
+    }
+    if testing {
+        return;
+    }
+    let (res2, dir2) = (res.clone(), dir.to_owned());
+    rt.spawn(async move {
+        tokio::time::sleep(Duration::from_secs(90)).await;
+        let stamp = tools::tools_dir(&dir2).join("yt-dlp.checked");
+        let due = std::fs::metadata(&stamp)
+            .and_then(|m| m.modified())
+            .map(|t| t.elapsed().unwrap_or_default() > Duration::from_secs(24 * 3600))
+            .unwrap_or(true);
+        if due {
+            res2.update_ytdlp().await;
+            let _ = std::fs::create_dir_all(tools::tools_dir(&dir2));
+            let _ = std::fs::write(&stamp, b"");
+        }
+    });
+    if install::is_installed_copy() {
+        let http = http.clone();
+        rt.spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            loop {
+                if let Ok(Some(v)) = install::update_from_github(&http).await {
+                    notify(format!("Yusic {v} is ready. Restart to update."));
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
+            }
+        });
+    }
+}
+
+/// Shows "Restart to update" once the exe on disk has been replaced (by the
+/// GitHub updater or scripts\deploy.ps1).
+fn watch_for_new_version(ui: &AppWindow) -> slint::Timer {
+    let start = install::exe_stamp();
+    let weak = ui.as_weak();
+    let timer = slint::Timer::default();
+    timer.start(slint::TimerMode::Repeated, Duration::from_secs(30), move || {
+        if start.is_some() && install::exe_stamp() != start {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_update_ready(true);
+            }
+        }
+    });
+    timer
 }
 
 fn save_snapshot(ui: &AppWindow, path: &std::path::Path) -> Result<()> {
