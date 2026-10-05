@@ -133,12 +133,20 @@ fn parse_list_item(r: &Value) -> Option<Item> {
         (kind == Kind::Album).then(|| Link { name: run_str(run), id: Some(id) })
     });
     item.subtitle = sub_runs.iter().map(run_str).collect::<String>();
+    item.duration = r
+        .pointer("/fixedColumns/0/musicResponsiveListItemFixedColumnRenderer/text")
+        .map(|t| runs_text(Some(t)))
+        .and_then(|t| parse_duration(&t));
 
     let video_id = r
         .pointer("/playlistItemData/videoId")
         .or_else(|| col(0).and_then(|t| t.pointer("/runs/0/navigationEndpoint/watchEndpoint/videoId")))
         .or_else(|| r.pointer("/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint/watchEndpoint/videoId"))
         .and_then(Value::as_str);
+    item.set_video_id = r
+        .pointer("/playlistItemData/playlistSetVideoId")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     if let Some(v) = video_id {
         item.id = v.to_owned();
         let w = col(0)
@@ -152,6 +160,154 @@ fn parse_list_item(r: &Value) -> Option<Item> {
     item.kind = kind;
     item.id = id;
     Some(item)
+}
+
+/// "3:45" / "1:02:03" -> seconds.
+fn parse_duration(s: &str) -> Option<u32> {
+    let mut total = 0u32;
+    for part in s.trim().split(':') {
+        total = total.checked_mul(60)?.checked_add(part.trim().parse().ok()?)?;
+    }
+    (total > 0).then_some(total)
+}
+
+pub struct ParsedPlaylist {
+    /// The user's own (editable) playlist.
+    pub owned: bool,
+    /// "Save to library" state, when the page offers it.
+    pub saved: Option<bool>,
+    pub title: String,
+    pub subtitle: String,
+    pub second_subtitle: String,
+    pub description: String,
+    pub thumb: String,
+    pub items: Vec<Item>,
+    pub continuation: Option<String>,
+}
+
+/// A playlist page (`browseId=VL<id>`), including the user's own editable
+/// playlists and Liked music, which use the album-style responsive header.
+pub fn parse_playlist(v: &Value) -> Option<ParsedPlaylist> {
+    let tc = v.pointer("/contents/twoColumnBrowseResultsRenderer")?;
+    let head_section = tc.pointer("/tabs/0/tabRenderer/content/sectionListRenderer/contents/0");
+    let header = head_section.and_then(|h| {
+        h.pointer("/musicEditablePlaylistDetailHeaderRenderer/header/musicResponsiveHeaderRenderer")
+            .or_else(|| h.get("musicResponsiveHeaderRenderer"))
+    });
+    let shelf = tc.pointer("/secondaryContents/sectionListRenderer/contents/0/musicPlaylistShelfRenderer")?;
+    let (items, continuation) = list_with_continuation(shelf.get("contents"));
+    let description = header
+        .and_then(|h| h.pointer("/description/musicDescriptionShelfRenderer/description"))
+        .map(|d| runs_text(Some(d)))
+        .unwrap_or_default();
+    let owned = head_section.is_some_and(|h| h.get("musicEditablePlaylistDetailHeaderRenderer").is_some());
+    Some(ParsedPlaylist {
+        owned,
+        saved: if owned { None } else { library_toggle(v) },
+        title: runs_text(header.and_then(|h| h.get("title"))),
+        subtitle: runs_text(header.and_then(|h| h.get("subtitle"))),
+        second_subtitle: runs_text(header.and_then(|h| h.get("secondSubtitle"))),
+        description,
+        thumb: last_thumb(header.and_then(|h| h.pointer("/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails"))),
+        items,
+        continuation: continuation.or_else(|| {
+            shelf
+                .pointer("/continuations/0/nextContinuationData/continuation")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        }),
+    })
+}
+
+/// Depth-first search for the first object with key `key`.
+pub fn find_key<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
+    match v {
+        Value::Object(m) => {
+            if let Some(x) = m.get(key) {
+                return Some(x);
+            }
+            m.values().find_map(|x| find_key(x, key))
+        }
+        Value::Array(a) => a.iter().find_map(|x| find_key(x, key)),
+        _ => None,
+    }
+}
+
+fn all_with_key<'a>(v: &'a Value, key: &str, out: &mut Vec<&'a Value>) {
+    match v {
+        Value::Object(m) => {
+            if let Some(x) = m.get(key) {
+                out.push(x);
+            }
+            for x in m.values() {
+                all_with_key(x, key, out);
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|x| all_with_key(x, key, out)),
+        _ => {}
+    }
+}
+
+/// The "Save to library" toggle on album/playlist pages: Some(saved).
+pub fn library_toggle(v: &Value) -> Option<bool> {
+    let mut toggles = Vec::new();
+    all_with_key(v.get("contents").unwrap_or(v), "toggleButtonRenderer", &mut toggles);
+    toggles.into_iter().find_map(|t| {
+        let icon = t.pointer("/defaultIcon/iconType").and_then(Value::as_str).unwrap_or_default();
+        icon.contains("LIBRARY").then(|| t.get("isToggled").and_then(Value::as_bool).unwrap_or(false))
+    })
+}
+
+/// Artist page subscribe button: (channel id, subscribed).
+pub fn subscription(v: &Value) -> Option<(String, bool)> {
+    let b = find_key(v, "subscribeButtonRenderer")?;
+    let id = b.get("channelId").and_then(Value::as_str)?.to_owned();
+    Some((id, b.get("subscribed").and_then(Value::as_bool).unwrap_or(false)))
+}
+
+/// Like status from a `next` response: "LIKE", "DISLIKE" or "INDIFFERENT".
+pub fn like_status(v: &Value) -> Option<String> {
+    let b = find_key(v, "likeButtonRenderer")?;
+    b.get("likeStatus").and_then(Value::as_str).map(str::to_owned)
+}
+
+/// More playlist rows, from either continuation response style.
+pub fn parse_playlist_continuation(v: &Value) -> (Vec<Item>, Option<String>) {
+    if let Some(items) = v.pointer("/onResponseReceivedActions/0/appendContinuationItemsAction/continuationItems") {
+        return list_with_continuation(Some(items));
+    }
+    if let Some(shelf) = v.pointer("/continuationContents/musicPlaylistShelfContinuation") {
+        let (items, cont) = list_with_continuation(shelf.get("contents"));
+        let cont = cont.or_else(|| {
+            shelf
+                .pointer("/continuations/0/nextContinuationData/continuation")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+        return (items, cont);
+    }
+    (Vec::new(), None)
+}
+
+/// Rows plus the token from a trailing `continuationItemRenderer`, if any.
+fn list_with_continuation(contents: Option<&Value>) -> (Vec<Item>, Option<String>) {
+    let Some(arr) = contents.and_then(Value::as_array) else { return (Vec::new(), None) };
+    let mut cont = None;
+    let items = arr
+        .iter()
+        .filter_map(|c| {
+            if let Some(t) = c
+                .pointer("/continuationItemRenderer/continuationEndpoint/continuationCommand/token")
+                .and_then(Value::as_str)
+            {
+                cont = Some(t.to_owned());
+                return None;
+            }
+            parse_item(c)
+        })
+        .filter(|i| i.kind.playable())
+        .collect();
+    (items, cont)
 }
 
 fn watch_kind(w: &Value) -> Kind {
@@ -228,6 +384,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_durations() {
+        assert_eq!(parse_duration("3:45"), Some(225));
+        assert_eq!(parse_duration("1:02:03"), Some(3723));
+        assert_eq!(parse_duration("live"), None);
+    }
+
+    #[test]
+    fn parses_editable_playlist() {
+        let row = |id: &str| serde_json::json!({"musicResponsiveListItemRenderer": {
+            "flexColumns": [
+                {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "Song"}]}}},
+                {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "Artist", "navigationEndpoint": {"browseEndpoint": {"browseId": "UCx",
+                    "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {"pageType": "MUSIC_PAGE_TYPE_ARTIST"}}}}}]}}}
+            ],
+            "fixedColumns": [{"musicResponsiveListItemFixedColumnRenderer": {"text": {"runs": [{"text": "3:05"}]}}}],
+            "playlistItemData": {"videoId": id}
+        }});
+        let v = serde_json::json!({"contents": {"twoColumnBrowseResultsRenderer": {
+            "tabs": [{"tabRenderer": {"content": {"sectionListRenderer": {"contents": [{"musicEditablePlaylistDetailHeaderRenderer": {"header": {"musicResponsiveHeaderRenderer": {
+                "title": {"runs": [{"text": "Mine"}]},
+                "subtitle": {"runs": [{"text": "Playlist"}, {"text": " • "}, {"text": "Private"}]},
+                "secondSubtitle": {"runs": [{"text": "2 songs"}]},
+                "thumbnail": {"musicThumbnailRenderer": {"thumbnail": {"thumbnails": [{"url": "t"}]}}}
+            }}}}]}}}}],
+            "secondaryContents": {"sectionListRenderer": {"contents": [{"musicPlaylistShelfRenderer": {"contents": [
+                row("aaaaaaaaaaa"), row("bbbbbbbbbbb"),
+                {"continuationItemRenderer": {"continuationEndpoint": {"continuationCommand": {"token": "NEXT"}}}}
+            ]}}]}}
+        }}});
+        let p = parse_playlist(&v).unwrap();
+        assert_eq!(p.title, "Mine");
+        assert_eq!(p.second_subtitle, "2 songs");
+        assert_eq!(p.items.len(), 2);
+        assert_eq!(p.items[0].duration, Some(185));
+        assert_eq!(p.items[0].artists[0].name, "Artist");
+        assert_eq!(p.continuation.as_deref(), Some("NEXT"));
+    }
+
+    #[test]
     fn parses_carousel_and_continuation() {
         let v = serde_json::json!({
             "contents": {"singleColumnBrowseResultsRenderer": {"tabs": [{"tabRenderer": {"content": {"sectionListRenderer": {
@@ -253,5 +448,26 @@ mod tests {
         assert_eq!(it.id, "RDCLAK5uy");
         assert_eq!(it.thumb, "b");
         assert_eq!(it.artists[0].id.as_deref(), Some("UCabc"));
+    }
+}
+
+#[cfg(test)]
+mod sample_tests {
+    /// Runs the playlist parser on a saved response:
+    /// `YUSIC_PLAYLIST_JSON=path cargo test -- --ignored sample_playlist`.
+    #[test]
+    #[ignore]
+    fn sample_playlist() {
+        let path = std::env::var("YUSIC_PLAYLIST_JSON").expect("YUSIC_PLAYLIST_JSON");
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let p = super::parse_playlist(&v).expect("parsed");
+        let with_dur = p.items.iter().filter(|i| i.duration.is_some()).count();
+        let with_artist = p.items.iter().filter(|i| !i.artists.is_empty()).count();
+        let with_thumb = p.items.iter().filter(|i| !i.thumb.is_empty()).count();
+        println!(
+            "title={} items={} durations={} artists={} thumbs={} header_thumb={} continuation={}",
+            !p.title.is_empty(), p.items.len(), with_dur, with_artist, with_thumb, !p.thumb.is_empty(), p.continuation.is_some()
+        );
+        assert!(!p.items.is_empty());
     }
 }

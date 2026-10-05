@@ -25,6 +25,9 @@ use crate::yt::Yt;
 use crate::yt::lyrics::{self, LyricsBody};
 use crate::{AppWindow, Bridge, CardData, HeaderData, NowData, ShelfData, TrackData};
 
+mod actions;
+use actions::{DialogMode, MenuTarget};
+
 /// Consecutive unplayable tracks before playback stops instead of skipping on.
 const MAX_FAILS: u32 = 3;
 
@@ -37,6 +40,7 @@ pub enum Route {
     Album(String),
     Playlist(String),
     Artist(String),
+    Settings,
 }
 
 impl Route {
@@ -45,6 +49,7 @@ impl Route {
         match kind {
             "explore" => Route::Explore,
             "library" => Route::Library,
+            "settings" => Route::Settings,
             "search" if !arg.is_empty() => Route::Search(arg.into()),
             "album" if !arg.is_empty() => Route::Album(arg.into()),
             "playlist" if !arg.is_empty() => Route::Playlist(arg.into()),
@@ -58,6 +63,7 @@ impl Route {
             Route::Home => "home",
             Route::Explore => "explore",
             Route::Library => "library",
+            Route::Settings => "settings",
             _ => "",
         }
     }
@@ -107,9 +113,18 @@ struct State {
     pending_advance: bool,
     /// Track we already fetched end-of-queue autoplay for.
     autoplay_for: Option<String>,
+    /// Queue thumbnails were requested for the current queue rows.
+    queue_images: bool,
+    /// Bumped only when the whole queue is replaced; radio results for an
+    /// older queue are dropped (jumping within the queue keeps them).
+    queue_gen: u64,
+    /// The shown page predates a sign-in change; don't cache it on leaving.
+    page_stale: bool,
     last_volume: f32,
 
     signed_in: bool,
+    menu: Option<MenuTarget>,
+    dialog: DialogMode,
     /// Recently shown pages, for instant back/revisits.
     page_cache: Vec<(Route, Instant, Page)>,
     /// Tracks whose best-quality file Windows couldn't decode; these use the
@@ -194,6 +209,11 @@ pub struct App {
     queue_model: Rc<VecModel<TrackData>>,
     sidebar_model: Rc<VecModel<CardData>>,
     profile_wipe: RefCell<Option<AbortHandle>>,
+    http: reqwest::Client,
+    /// Save settings changes to disk (off for test runs).
+    pub persist: std::cell::Cell<bool>,
+    /// Debounces saving after volume changes.
+    save_timer: Timer,
     st: RefCell<State>,
     pub settings: RefCell<Settings>,
 }
@@ -205,6 +225,7 @@ impl App {
         yt: Arc<Yt>,
         res: Arc<Resolver>,
         data_dir: PathBuf,
+        http: reqwest::Client,
         settings: Settings,
     ) -> Result<Rc<App>> {
         let player = Player::new(|ev| {
@@ -239,11 +260,15 @@ impl App {
             queue_model,
             sidebar_model,
             profile_wipe: RefCell::new(None),
+            http,
+            persist: std::cell::Cell::new(true),
+            save_timer: Timer::default(),
             st: RefCell::new(State { visible: true, rng: seed | 1, last_volume, ..Default::default() }),
             settings: RefCell::new(settings),
         });
         APP.with(|a| *a.borrow_mut() = Some(app.clone()));
         Self::bind(ui);
+        app.apply_settings();
         Ok(app)
     }
 
@@ -351,6 +376,74 @@ impl App {
         b.on_sign_in(with(|a| a.sign_in()));
         b.on_sign_out(with(|a| a.sign_out()));
         b.on_np_changed(with(|a| a.np_changed()));
+        b.on_track_menu(|si, row, x, y| {
+            if let Some(a) = app() {
+                let item = {
+                    let st = a.st.borrow();
+                    st.page.shelves.get(si as usize).and_then(|s| s.items.get(row as usize)).cloned()
+                };
+                if let Some(item) = item {
+                    a.track_menu(item, None, x, y);
+                }
+            }
+        });
+        b.on_queue_menu(|i, x, y| {
+            if let Some(a) = app() {
+                let item = a.st.borrow().queue.get(i as usize).cloned();
+                if let Some(item) = item {
+                    a.track_menu(item, Some(i as usize), x, y);
+                }
+            }
+        });
+        b.on_now_menu(|x, y| {
+            if let Some(a) = app() {
+                let (item, qi) = {
+                    let st = a.st.borrow();
+                    (st.current().cloned(), st.qi)
+                };
+                if let Some(item) = item {
+                    a.track_menu(item, Some(qi), x, y);
+                }
+            }
+        });
+        b.on_card_menu(|c, x, y| {
+            if let Some(a) = app() {
+                a.card_menu(c, x, y);
+            }
+        });
+        b.on_menu_action(|id| {
+            if let Some(a) = app() {
+                a.menu_action(&id);
+            }
+        });
+        b.on_rate(|v| {
+            if let Some(a) = app() {
+                a.rate_current(v);
+            }
+        });
+        b.on_toggle_saved(with(|a| a.toggle_saved()));
+        b.on_toggle_subscribed(with(|a| a.toggle_subscribed()));
+        b.on_new_playlist(with(|a| a.new_playlist()));
+        b.on_edit_playlist(with(|a| a.edit_playlist()));
+        b.on_delete_playlist(with(|a| a.delete_playlist()));
+        b.on_dialog_submit(with(|a| a.dialog_submit()));
+        b.on_dialog_cancel(with(|a| a.close_dialog()));
+        b.on_choose_playlist(|id| {
+            if let Some(a) = app() {
+                a.choose_playlist(id.to_string());
+            }
+        });
+        b.on_open_settings(with(|a| a.navigate(Route::Settings, true)));
+        b.on_setting(|k, v| {
+            if let Some(a) = app() {
+                a.change_setting(&k, &v);
+            }
+        });
+        b.on_check_updates(with(|a| a.check_updates()));
+        b.on_update_ytdlp(with(|a| a.update_ytdlp_now()));
+        b.on_open_url(|url| {
+            crate::win::open_url(&url);
+        });
         b.on_restart_update(with(|a| {
             if let Err(e) = crate::install::spawn_restart() {
                 a.toast(format!("Couldn't restart: {e:#}"));
@@ -420,7 +513,9 @@ impl App {
             // Remember the page we're leaving, including anything loaded since.
             if let Some(leaving) = st.route.clone() {
                 let page = std::mem::take(&mut st.page);
-                st.cache_page(leaving, page);
+                if !std::mem::take(&mut st.page_stale) {
+                    st.cache_page(leaving, page);
+                }
             }
             if push {
                 if let Some(cur) = st.route.take() {
@@ -455,6 +550,11 @@ impl App {
         if let Route::Search(q) = &route {
             ui.set_search_text(q.into());
         }
+        if route == Route::Settings {
+            ui.set_loading(false);
+            ui.set_settings(self.settings_data());
+            return;
+        }
         if let Some(page) = cached {
             ui.set_loading(true);
             self.show_page(tok, Ok(page));
@@ -472,6 +572,7 @@ impl App {
                     Route::Album(id) => yt.album(&id).await,
                     Route::Playlist(id) => yt.playlist(&id).await,
                     Route::Artist(id) => yt.artist(&id).await,
+                    Route::Settings => Ok(Page::default()),
                 }
                 .map_err(|e| format!("{e:#}"))
             },
@@ -506,7 +607,13 @@ impl App {
                 return;
             }
         };
-        let (header, image) = header_data(&page.header);
+        let (mut header, image) = header_data(&page.header);
+        let a = &page.actions;
+        header.saveable = a.library_id.is_some() && a.saved.is_some();
+        header.saved = a.saved.unwrap_or(false);
+        header.owned = a.owned_playlist.is_some();
+        header.subscribable = a.channel_id.is_some();
+        header.subscribed = a.subscribed.unwrap_or(false);
         ui.set_header(header);
         if let Some((thumb, w, h)) = image {
             // After set_header: a cached image calls back immediately.
@@ -535,6 +642,7 @@ impl App {
         ui.set_shelves(ModelRc::from(shelves.clone()));
         let mut st = self.st.borrow_mut();
         st.page = page;
+        st.page_stale = false;
         st.shelf_models = models;
         st.shelves_model = Some(shelves);
     }
@@ -577,34 +685,43 @@ impl App {
                     },
                 );
             }
+            Continuation::PlaylistRows(token) => {
+                self.spawn(
+                    async move { yt.playlist_more(&token).await.map_err(|e| e.to_string()) },
+                    move |app, res| app.append_tracks(tok, res.map(|(i, n)| (i, n.map(Continuation::PlaylistRows)))),
+                );
+            }
             Continuation::Tracks(pag) => {
                 self.spawn(
                     async move { yt.more_tracks(&pag).await.map_err(|e| e.to_string()) },
-                    move |app, res| {
-                        let current = app.current_id();
-                        let mut st = app.st.borrow_mut();
-                        if st.page_gen != tok {
-                            return;
-                        }
-                        st.loading_more = false;
-                        let Ok((items, next)) = res else {
-                            st.page.continuation = None;
-                            return;
-                        };
-                        st.page.continuation = next.map(Continuation::Tracks);
-                        let Some(shelf) = st.page.shelves.first() else { return };
-                        let base = shelf.items.len();
-                        if let Some(m) = st.shelf_models.first() {
-                            for (k, it) in items.iter().enumerate() {
-                                push_track(&m.tracks, base + k, it, current.as_deref());
-                            }
-                        }
-                        st.page.shelves[0].items.extend(items.iter().cloned());
-                        st.page.play.extend(items);
-                    },
+                    move |app, res| app.append_tracks(tok, res.map(|(i, n)| (i, n.map(Continuation::Tracks)))),
                 );
             }
         }
+    }
+
+    /// Appends the next page of a playlist's rows.
+    fn append_tracks(&self, tok: u64, res: Result<(Vec<Item>, Option<Continuation>), String>) {
+        let current = self.current_id();
+        let mut st = self.st.borrow_mut();
+        if st.page_gen != tok {
+            return;
+        }
+        st.loading_more = false;
+        let Ok((items, next)) = res else {
+            st.page.continuation = None;
+            return;
+        };
+        st.page.continuation = next;
+        let Some(shelf) = st.page.shelves.first() else { return };
+        let base = shelf.items.len();
+        if let Some(m) = st.shelf_models.first() {
+            for (k, it) in items.iter().enumerate() {
+                push_track(&m.tracks, base + k, it, current.as_deref());
+            }
+        }
+        st.page.shelves[0].items.extend(items.iter().cloned());
+        st.page.play.extend(items);
     }
 
     fn suggest(self: &Rc<Self>, q: String) {
@@ -778,6 +895,7 @@ impl App {
         let (shuffle, req) = {
             let mut st = self.st.borrow_mut();
             st.play_req += 1;
+            st.queue_gen += 1;
             st.queue = items;
             st.qi = start;
             st.radio_more = None;
@@ -785,7 +903,7 @@ impl App {
             st.pending_advance = false;
             st.autoplay_for = None;
             st.fail_streak = 0;
-            (st.shuffle, st.play_req)
+            (st.shuffle, st.queue_gen)
         };
         if shuffle {
             // Keep the chosen track first, shuffle the rest.
@@ -807,17 +925,19 @@ impl App {
                 move |app, r| {
                     {
                         let mut st = app.st.borrow_mut();
-                        if st.play_req != req {
+                        if st.queue_gen != req {
                             return;
                         }
                         st.radio_busy = false;
-                        if st.queue.len() != 1 || st.queue[0].id != id {
+                        let Some((items, more)) = r else {
+                            drop(st);
+                            app.radio_failed();
                             return;
-                        }
-                        if let Some((items, more)) = r {
-                            st.queue.extend(items.into_iter().filter(|i| i.id != id && i.kind.playable()));
-                            st.radio_more = more;
-                        }
+                        };
+                        // Songs queued meanwhile stay; the radio goes after them.
+                        let have: HashSet<String> = st.queue.iter().map(|i| i.id.clone()).collect();
+                        st.queue.extend(items.into_iter().filter(|i| i.kind.playable() && !have.contains(&i.id)));
+                        st.radio_more = more;
                     }
                     app.refresh_queue();
                     app.resume_if_waiting();
@@ -836,6 +956,7 @@ impl App {
             }
             match st.radio_more.take() {
                 Some(p) => (Some(p), None),
+                None if !self.settings.borrow().autoplay => return,
                 None => {
                     let last = st.queue.last().map(|i| i.id.clone()).unwrap_or_default();
                     if st.autoplay_for.as_deref() == Some(last.as_str()) {
@@ -849,8 +970,10 @@ impl App {
         let req = {
             let mut st = self.st.borrow_mut();
             st.radio_busy = true;
-            st.play_req
+            st.queue_gen
         };
+        // Kept so a failed fetch can be retried later.
+        let retry = pag.clone();
         let yt = self.yt.clone();
         self.spawn(
             async move {
@@ -863,11 +986,20 @@ impl App {
             move |app, r| {
                 {
                     let mut st = app.st.borrow_mut();
-                    if st.play_req != req {
+                    if st.queue_gen != req {
                         return;
                     }
                     st.radio_busy = false;
-                    let Some((items, more)) = r else { return };
+                    let Some((items, more)) = r else {
+                        if retry.is_some() {
+                            st.radio_more = retry;
+                        } else {
+                            st.autoplay_for = None;
+                        }
+                        drop(st);
+                        app.radio_failed();
+                        return;
+                    };
                     let have: HashSet<String> = st.queue.iter().map(|i| i.id.clone()).collect();
                     st.queue.extend(items.into_iter().filter(|i| i.kind.playable() && !have.contains(&i.id)));
                     st.radio_more = more;
@@ -877,6 +1009,15 @@ impl App {
                 app.prefetch_next();
             },
         );
+    }
+
+    /// More songs couldn't be fetched. If playback was waiting on them, say so
+    /// instead of staying silent; the next track change tries again.
+    fn radio_failed(self: &Rc<Self>) {
+        let waiting = std::mem::take(&mut self.st.borrow_mut().pending_advance);
+        if waiting {
+            self.toast("Couldn't load more songs.");
+        }
     }
 
     fn resume_if_waiting(self: &Rc<Self>) {
@@ -901,8 +1042,20 @@ impl App {
             })
             .collect();
         self.queue_model.set_vec(rows);
-        for (i, it) in queue.iter().enumerate() {
-            load_track_image(&self.queue_model, i, &it.id, &it.thumb);
+        self.st.borrow_mut().queue_images = false;
+        self.load_queue_images();
+    }
+
+    /// Queue thumbnails are fetched only while the Now Playing panel is open.
+    fn load_queue_images(&self) {
+        let ui = self.ui();
+        if !ui.get_np_open() || !self.st.borrow().visible || self.st.borrow().queue_images {
+            return;
+        }
+        self.st.borrow_mut().queue_images = true;
+        let thumbs: Vec<(String, String)> = self.st.borrow().queue.iter().map(|i| (i.id.clone(), i.thumb.clone())).collect();
+        for (i, (id, thumb)) in thumbs.iter().enumerate() {
+            load_track_image(&self.queue_model, i, id, thumb);
         }
     }
 
@@ -935,6 +1088,9 @@ impl App {
             st.prune_downloads(&keep);
             (item, st.play_gen, next)
         };
+        // Unload the previous track first: it releases the file so it can be
+        // deleted, and media keys can't resume it while the next one downloads.
+        self.player.clear();
         let mut keep = vec![item.id.as_str()];
         if let Some(n) = &next {
             keep.push(n);
@@ -954,15 +1110,16 @@ impl App {
         });
         ui.set_buffering(true);
         self.reset_lyrics();
+        self.load_rating(&item.id);
         ui.set_playing(false);
         ui.set_progress(0.0);
         ui.set_time_text("".into());
         self.reload_now_images();
-        // Unload the previous track so media keys can't resume it while the
-        // next one downloads (this also releases its file for deletion).
-        self.player.clear();
         self.mark_active(&item.id);
 
+        if item.title == item.id && item.artists.is_empty() {
+            self.fill_metadata(&item.id);
+        }
         let res = self.res.clone();
         let id = item.id.clone();
         let cookie = self.yt.cookie();
@@ -1000,8 +1157,40 @@ impl App {
         self.prefetch_next();
     }
 
+    /// Looks up title/artist/art for a track queued by id only.
+    fn fill_metadata(self: &Rc<Self>, id: &str) {
+        let yt = self.yt.clone();
+        let vid = id.to_owned();
+        self.spawn(async move { yt.track(&vid).await.ok() }, move |app, item| {
+            let Some(item) = item else { return };
+            let is_current = {
+                let mut st = app.st.borrow_mut();
+                for q in st.queue.iter_mut().filter(|q| q.id == item.id) {
+                    *q = item.clone();
+                }
+                st.current().is_some_and(|c| c.id == item.id)
+            };
+            app.refresh_queue();
+            if is_current {
+                let ui = app.ui();
+                let mut now = ui.get_now();
+                now.title = item.title.as_str().into();
+                now.artists = item.artist_names().into();
+                now.album = item.album.as_ref().map(|a| a.name.as_str()).unwrap_or_default().into();
+                now.artist_id = item.first_artist_id().unwrap_or_default().into();
+                now.album_id = item.album.as_ref().and_then(|a| a.id.as_deref()).unwrap_or_default().into();
+                ui.set_now(now);
+                app.reload_now_images();
+            }
+        });
+    }
+
     fn quality_for(&self, id: &str) -> Quality {
-        if self.st.borrow().compat.contains(id) { Quality::Compatible } else { Quality::Best }
+        if self.settings.borrow().quality == "standard" || self.st.borrow().compat.contains(id) {
+            Quality::Compatible
+        } else {
+            Quality::Best
+        }
     }
 
     /// Windows couldn't play the downloaded file: fetch the track once more in
@@ -1010,7 +1199,7 @@ impl App {
         let retry = {
             let mut st = self.st.borrow_mut();
             match st.current().map(|i| i.id.clone()) {
-                Some(id) if st.play_gen == tok && !st.compat.contains(&id) => {
+                Some(id) if st.play_gen == tok && !st.compat.contains(&id) && self.settings.borrow().quality != "standard" => {
                     st.compat.insert(id);
                     true
                 }
@@ -1071,7 +1260,7 @@ impl App {
         let mut st = self.st.borrow_mut();
         st.prune_downloads(&keep);
         // The current track gets the bandwidth first.
-        if !st.has_source {
+        if !st.has_source || !self.settings.borrow().prefetch {
             return;
         }
         let Some(next) = next.filter(|n| Some(n) != cur.as_ref()) else { return };
@@ -1080,7 +1269,11 @@ impl App {
         }
         let res = self.res.clone();
         let cookie = self.yt.cookie();
-        let quality = if st.compat.contains(&next) { Quality::Compatible } else { Quality::Best };
+        let quality = if self.settings.borrow().quality == "standard" || st.compat.contains(&next) {
+            Quality::Compatible
+        } else {
+            Quality::Best
+        };
         let id = next.clone();
         let h = self.rt.spawn(async move {
             let _ = res.ensure(&id, cookie, quality).await;
@@ -1115,7 +1308,11 @@ impl App {
             match st.next_index() {
                 Some(i) => st.qi = i,
                 None => {
-                    // End of the queue: autoplay may still be loading.
+                    // End of the queue: more songs may be loading, or a failed
+                    // fetch can be retried now.
+                    drop(st);
+                    self.extend_queue();
+                    let mut st = self.st.borrow_mut();
                     if st.radio_busy {
                         st.pending_advance = true;
                         drop(st);
@@ -1192,6 +1389,30 @@ impl App {
             self.st.borrow_mut().last_volume = v;
         }
         self.settings.borrow_mut().volume = v;
+        if self.persist.get() {
+            self.save_timer.start(TimerMode::SingleShot, Duration::from_secs(2), || {
+                if let Some(a) = app() {
+                    a.save_settings();
+                }
+            });
+        }
+    }
+
+    /// Records the window size and sidebar state, and saves settings. Safe to
+    /// call from nested message handling (does nothing if settings are busy).
+    pub fn remember_window(&self) {
+        let ui = self.ui();
+        let Ok(mut s) = self.settings.try_borrow_mut() else { return };
+        let size = ui.window().size();
+        s.maximized = ui.window().is_maximized();
+        if !s.maximized && size.width >= 400 && !crate::win::is_minimized(ui.window()) {
+            s.width = size.width;
+            s.height = size.height;
+        }
+        s.sidebar_wide = ui.get_sidebar_wide();
+        if self.persist.get() {
+            s.save(&self.data_dir);
+        }
     }
 
     fn toggle_mute(&self) {
@@ -1256,7 +1477,7 @@ impl App {
             let st = self.st.borrow();
             (st.playing, st.visible, !st.lyrics_times.is_empty())
         };
-        if !(playing && visible) {
+        if !(playing && visible) || crate::win::is_minimized(self.ui().window()) {
             self.tick.stop();
             return;
         }
@@ -1281,8 +1502,9 @@ impl App {
     }
 
     fn update_position(&self) {
-        // Don't redraw (software rendering costs CPU) behind a fullscreen game.
-        let game = crate::win::fullscreen_app_active();
+        // Don't redraw (software rendering costs CPU) behind a fullscreen game
+        // on Yusic's monitor.
+        let game = self.settings.borrow().game_mode && crate::win::covered_by_fullscreen(self.ui().window());
         if game != self.st.borrow().game_mode {
             self.st.borrow_mut().game_mode = game;
             self.update_timer();
@@ -1320,6 +1542,7 @@ impl App {
         if self.lyrics_visible() {
             self.ensure_lyrics();
         }
+        self.load_queue_images();
         self.update_timer();
         self.update_position();
     }
@@ -1437,10 +1660,11 @@ impl App {
             st.signed_in = on;
             // Pages differ when signed in (personal Home, Library, private playlists).
             st.page_cache.clear();
+            st.page_stale = true;
         }
         self.ui().set_signed_in(on);
         if !on {
-            self.sidebar_model.set_vec(Vec::new());
+            self.set_playlists(&[]);
             return;
         }
         let yt = self.yt.clone();
@@ -1448,7 +1672,7 @@ impl App {
             async move { yt.sidebar_playlists().await.unwrap_or_default() },
             |app, items| {
                 if app.st.borrow().signed_in {
-                    app.sidebar_model.set_vec(items.iter().map(card_data).collect::<Vec<_>>());
+                    app.set_playlists(&items);
                 }
             },
         );
@@ -1539,6 +1763,16 @@ impl App {
             images::trim();
         } else {
             self.update_position();
+            self.load_queue_images();
+        }
+        self.update_timer();
+    }
+
+    /// Minimized or restored.
+    pub fn window_state_changed(&self) {
+        let minimized = crate::win::is_minimized(self.ui().window());
+        if !minimized && self.st.borrow().visible {
+            self.update_position();
         }
         self.update_timer();
     }
@@ -1548,6 +1782,8 @@ impl App {
         let _ = ui.show();
         crate::win::apply_app_icon(ui.window());
         crate::win::bring_to_front(ui.window());
+        crate::win::install_paint_hook(&ui);
+        crate::win::full_repaint(&ui);
         self.set_visible(true);
         if self.rescale() {
             // Images were decoded for another display scale.
@@ -1719,6 +1955,11 @@ fn shelf_data(s: &Shelf, current: Option<&str>) -> (ShelfData, ShelfModels) {
         kind: s.kind.as_str().into(),
         cards: ModelRc::from(cards),
         tracks: ModelRc::from(tracks.clone()),
+        // A mostly empty album column only squeezes the artists.
+        show_album: {
+            let with_album = s.items.iter().filter(|i| i.album.is_some()).count();
+            with_album > 0 && with_album * 4 >= s.items.len()
+        },
     };
     (data, ShelfModels { tracks })
 }

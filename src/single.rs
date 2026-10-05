@@ -31,6 +31,20 @@ pub fn acquire() -> Option<Instance> {
     }
 }
 
+/// True while another Yusic holds the instance lock.
+pub fn is_running() -> bool {
+    use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+    unsafe {
+        match OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, w!("Local\\Yusic.Instance")) {
+            Ok(h) => {
+                let _ = CloseHandle(h);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
 impl Instance {
     /// Calls `f` (on a background thread) whenever another launch asks us to show.
     pub fn on_activate(&self, f: impl Fn() + Send + 'static) {

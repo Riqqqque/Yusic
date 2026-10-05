@@ -24,10 +24,14 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
 use windows::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_Programs, IShellLinkW, KF_FLAG_DEFAULT, SHGetKnownFolderPath, ShellLink};
-use windows::Win32::UI::WindowsAndMessaging::{IDYES, MB_ICONQUESTION, MB_YESNO, MessageBoxW};
+use windows::Win32::UI::WindowsAndMessaging::{IDOK, IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OKCANCEL, MB_YESNO, MessageBoxW};
 use windows::core::{GUID, HSTRING, Interface, PCWSTR};
 
 pub const REPO: &str = "Riqqqque/Yusic";
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+
+/// Settings > Updates > Update Yusic automatically.
+pub static AUTO_UPDATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 const APP_EXE: &str = "Yusic.exe";
 const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Yusic";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -59,8 +63,18 @@ pub fn is_installed_copy() -> bool {
 pub fn is_dev_copy() -> bool {
     let Some(exe) = current_exe() else { return true };
     let lower = exe.to_string_lossy().to_lowercase();
-    let project = Path::new(env!("CARGO_MANIFEST_DIR"));
-    lower.contains(r"\target\") || exe.starts_with(project) || exe.with_file_name("portable").exists()
+    lower.contains(r"\target\") || project_root().is_some() || exe.with_file_name("portable").exists()
+}
+
+/// The source checkout this exe runs from (its `target` or `dist` folder),
+/// found by looking around so no build path is compiled into the exe.
+pub fn project_root() -> Option<PathBuf> {
+    let exe = current_exe()?;
+    exe.ancestors()
+        .skip(1)
+        .take(5)
+        .find(|d| d.join("Cargo.toml").is_file() && d.join("src").join("main.rs").is_file())
+        .map(Path::to_path_buf)
 }
 
 fn known_folder(id: &GUID) -> Option<PathBuf> {
@@ -110,7 +124,7 @@ fn reg_set_dword(key: HKEY, name: &str, value: u32) {
     }
 }
 
-fn register_uninstall(exe: &Path) {
+fn register_uninstall(exe: &Path, version: &str) {
     let mut key = HKEY::default();
     unsafe {
         let created = RegCreateKeyExW(
@@ -130,7 +144,7 @@ fn register_uninstall(exe: &Path) {
     }
     let exe_s = exe.display().to_string();
     reg_set_str(key, "DisplayName", "Yusic");
-    reg_set_str(key, "DisplayVersion", env!("CARGO_PKG_VERSION"));
+    reg_set_str(key, "DisplayVersion", version);
     reg_set_str(key, "Publisher", "Rique");
     reg_set_str(key, "DisplayIcon", &exe_s);
     reg_set_str(key, "InstallLocation", &install_dir().display().to_string());
@@ -153,24 +167,31 @@ fn ask(text: &str) -> bool {
 }
 
 /// Puts `src` at `dest`, moving a (possibly running) old copy aside first.
+/// If that fails halfway, the old copy is put back so an exe always exists.
 fn replace_exe(src: &Path, dest: &Path, copy: bool) -> Result<()> {
+    let mut aside = None;
     if dest.exists() {
-        let stamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        std::fs::rename(dest, dest.with_file_name(format!("Yusic.old-{stamp}.exe")))
-            .context("could not move the old version aside")?;
+        let stamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let a = dest.with_file_name(format!("Yusic.old-{stamp}.exe"));
+        std::fs::rename(dest, &a).context("could not move the old version aside")?;
+        aside = Some(a);
     }
-    if copy {
-        std::fs::copy(src, dest)?;
-    } else {
-        std::fs::rename(src, dest)?;
+    let placed = if copy { std::fs::copy(src, dest).map(|_| ()) } else { std::fs::rename(src, dest) };
+    if let Err(e) = placed {
+        if let Some(a) = aside {
+            let _ = std::fs::remove_file(dest);
+            let _ = std::fs::rename(&a, dest);
+        }
+        return Err(e).context("could not put the new version in place");
     }
     Ok(())
 }
 
 /// First run of a downloaded copy: offer to install it. Returns true when the
 /// installed copy was started and this process should exit.
-pub fn maybe_install() -> Result<bool> {
-    if is_installed_copy() || is_dev_copy() {
+pub fn maybe_install(minimized: bool) -> Result<bool> {
+    // A copy started at sign-in (--minimized) never asks.
+    if minimized || is_installed_copy() || is_dev_copy() {
         return Ok(false);
     }
     let Some(exe) = current_exe() else { return Ok(false) };
@@ -187,7 +208,7 @@ pub fn maybe_install() -> Result<bool> {
     for lnk in shortcut_paths() {
         let _ = create_shortcut(&lnk, &target);
     }
-    register_uninstall(&target);
+    register_uninstall(&target, env!("CARGO_PKG_VERSION"));
     std::process::Command::new(&target).creation_flags(DETACHED_PROCESS).spawn()?;
     Ok(true)
 }
@@ -197,10 +218,25 @@ pub fn uninstall(data_dir: &Path) {
     if !ask("Uninstall Yusic?") {
         return;
     }
+    // The running copy holds its exe and data open.
+    while crate::single::is_running() {
+        let quit = unsafe {
+            MessageBoxW(
+                None,
+                &HSTRING::from("Yusic is still running. Quit it from its tray icon (right-click > Quit), then choose OK."),
+                &HSTRING::from("Yusic"),
+                MB_OKCANCEL | MB_ICONINFORMATION,
+            )
+        };
+        if quit != IDOK {
+            return;
+        }
+    }
     let wipe_data = ask("Also delete your Yusic settings, sign-in and downloaded tools?");
     for lnk in shortcut_paths() {
         let _ = std::fs::remove_file(lnk);
     }
+    let _ = set_autostart(false, false);
     unsafe {
         let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(UNINSTALL_KEY));
     }
@@ -213,6 +249,38 @@ pub fn uninstall(data_dir: &Path) {
         .raw_arg(format!("/c ping -n 3 127.0.0.1 >nul & rmdir /s /q \"{}\"", dir.display()))
         .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
         .spawn();
+}
+
+/// Adds or removes Yusic from the programs Windows starts at sign-in.
+pub fn set_autostart(enabled: bool, minimized: bool) -> Result<()> {
+    let mut key = HKEY::default();
+    unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            &HSTRING::from(RUN_KEY),
+            Some(0),
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            None,
+            &mut key,
+            None,
+        )
+        .ok()?;
+    }
+    if enabled {
+        let exe = current_exe().context("no exe path")?;
+        let cmd = if minimized { format!("\"{}\" --minimized", exe.display()) } else { format!("\"{}\"", exe.display()) };
+        reg_set_str(key, "Yusic", &cmd);
+    } else {
+        unsafe {
+            let _ = windows::Win32::System::Registry::RegDeleteValueW(key, &HSTRING::from("Yusic"));
+        }
+    }
+    unsafe {
+        let _ = RegCloseKey(key);
+    }
+    Ok(())
 }
 
 /// `--wait-for <pid>`: a restart waits for the old instance to exit first.
@@ -276,9 +344,28 @@ pub fn is_newer(tag: &str, current: &str) -> bool {
 /// Checks GitHub for a newer release and, if there is one, downloads and
 /// verifies it and swaps it into place. Returns the new version.
 pub async fn update_from_github(http: &reqwest::Client) -> Result<Option<String>> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    /// One update at a time: two would share the download file and could
+    /// leave no Yusic.exe behind.
+    static UPDATING: AtomicBool = AtomicBool::new(false);
+    /// Version already swapped in, waiting for a restart.
+    static STAGED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    struct Busy;
+    impl Drop for Busy {
+        fn drop(&mut self) {
+            UPDATING.store(false, Ordering::SeqCst);
+        }
+    }
+
     if !is_installed_copy() {
         return Ok(None);
     }
+    if UPDATING.swap(true, Ordering::SeqCst) {
+        bail!("an update is already being checked");
+    }
+    let _busy = Busy;
+    let staged = STAGED.lock().unwrap().clone();
+    let current = staged.clone().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
     let rel: Release = http
         .get(format!("https://api.github.com/repos/{REPO}/releases/latest"))
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
@@ -287,8 +374,9 @@ pub async fn update_from_github(http: &reqwest::Client) -> Result<Option<String>
         .error_for_status()?
         .json()
         .await?;
-    if rel.draft || rel.prerelease || !is_newer(&rel.tag_name, env!("CARGO_PKG_VERSION")) {
-        return Ok(None);
+    if rel.draft || rel.prerelease || !is_newer(&rel.tag_name, &current) {
+        // Nothing newer than what's installed (or already waiting for a restart).
+        return Ok(staged);
     }
     let asset = rel
         .assets
@@ -324,8 +412,10 @@ pub async fn update_from_github(http: &reqwest::Client) -> Result<Option<String>
         bail!("downloaded update failed verification");
     }
     replace_exe(&part, &dir.join(APP_EXE), false)?;
-    register_uninstall(&dir.join(APP_EXE));
-    Ok(Some(rel.tag_name.trim_start_matches('v').to_string()))
+    let version = rel.tag_name.trim_start_matches('v').to_string();
+    register_uninstall(&dir.join(APP_EXE), &version);
+    *STAGED.lock().unwrap() = Some(version.clone());
+    Ok(Some(version))
 }
 
 #[cfg(test)]

@@ -115,29 +115,47 @@ async fn search(http: &reqwest::Client, url: reqwest::Url) -> Vec<LrcRecord> {
     }
 }
 
+/// How well an LRCLIB title matches ours: exact, whole-word containment of
+/// a reasonably long title, or no match.
+fn title_match(want: &str, got: &str) -> Option<bool> {
+    if want.is_empty() || got.is_empty() {
+        return None;
+    }
+    if want == got {
+        return Some(true);
+    }
+    let (short, long) = if want.len() <= got.len() { (want, got) } else { (got, want) };
+    // Short titles ("me", "go") would match far too much.
+    if short.len() < 5 || short.split(' ').count() * 2 < long.split(' ').count() {
+        return None;
+    }
+    let padded = format!(" {long} ");
+    padded.contains(&format!(" {short} ")).then_some(false)
+}
+
 /// Best record whose title matches; `true` when it is confidently the same
-/// recording (same artist and length), so its timestamps can be trusted.
+/// recording (same title, artist and length), so its timestamps can be trusted.
 fn pick(recs: Vec<LrcRecord>, title: &str, t: &TrackInfo<'_>) -> Option<(LrcRecord, bool)> {
     let want = norm(title);
     let mut scored: Vec<(i64, bool, LrcRecord)> = recs
         .into_iter()
         .filter(|r| r.has_lyrics())
-        .filter(|r| {
-            let got = norm(&strip_noise(&r.track_name));
-            !got.is_empty() && (got.contains(&want) || want.contains(&got))
-        })
-        .map(|r| {
+        .filter_map(|r| {
+            let exact = title_match(&want, &norm(&strip_noise(&r.track_name)))?;
             let same_artist = artist_matches(&r.artist_name, t.artist);
             let diff = match (r.duration, t.duration) {
                 (Some(a), Some(b)) => (a - b as f64).abs(),
                 _ => 999.0,
             };
-            let confident = same_artist && diff <= 3.0;
-            // Prefer confident matches, then synced lyrics, then close length.
-            let score = (!confident as i64) * 1_000_000
+            let confident = exact && same_artist && diff <= 3.0;
+            // Prefer confident matches, then exact titles, then the right
+            // artist, then synced lyrics, then the closest length.
+            let score = (!confident as i64) * 100_000_000
+                + (!exact as i64) * 1_000_000
+                + (!same_artist as i64) * 100_000
                 + (r.synced_lyrics.is_none() as i64) * 10_000
                 + diff.min(9_999.0) as i64;
-            (score, confident, r)
+            Some((score, confident, r))
         })
         .collect();
     scored.sort_by_key(|s| s.0);
@@ -260,7 +278,9 @@ pub fn strip_noise(title: &str) -> String {
     }
     // "Song ft. Someone" / "Song feat. Someone" (outside brackets): cut the credit,
     // but keep a following " - " part.
-    let lower = out.to_lowercase();
+    // ASCII lowercasing keeps byte offsets identical to `out` (full Unicode
+    // lowercasing can change lengths, e.g. 'İ', and break the slicing below).
+    let lower = out.to_ascii_lowercase();
     for marker in [" ft. ", " feat. ", " ft ", " featuring "] {
         if let Some(i) = lower.find(marker) {
             let tail = lower[i..].find(" - ").map(|j| out[i + j..].to_string()).unwrap_or_default();
@@ -270,7 +290,7 @@ pub fn strip_noise(title: &str) -> String {
     }
     let mut out = out.trim().to_string();
     for suffix in [" cover", " lyrics", " official video", " official audio", " audio"] {
-        if out.to_lowercase().ends_with(suffix) {
+        if out.to_ascii_lowercase().ends_with(suffix) {
             out.truncate(out.len() - suffix.len());
             out = out.trim_end().to_string();
         }
@@ -387,6 +407,21 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(to_lyrics(rec, false).unwrap().body, LyricsBody::Plain(vec!["a".into(), "b".into()]));
+    }
+
+    #[test]
+    fn unicode_titles_dont_panic() {
+        let t = "SEVİYORUM SENİ DELİLER GİBİ ft. Şebnem - İstanbul";
+        let _ = strip_noise(t);
+        let _ = clean_title(t, "İzel");
+    }
+
+    #[test]
+    fn short_titles_dont_match_everything() {
+        assert_eq!(title_match("me", "look what you made me do"), None);
+        assert_eq!(title_match("like im gonna lose you", "like im gonna lose you"), Some(true));
+        assert_eq!(title_match("like im gonna lose you", "like im gonna lose you remix"), Some(false));
+        assert_eq!(title_match("love", "love story"), None);
     }
 
     #[test]

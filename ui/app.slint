@@ -1,11 +1,11 @@
-import { ScrollView, Spinner } from "std-widgets.slint";
+import { ScrollView, Spinner, ComboBox } from "std-widgets.slint";
 import { Theme, Icons } from "theme.slint";
 import {
-    CardData, TrackData, ShelfData, HeaderData, NowData, Bridge,
+    CardData, TrackData, ShelfData, HeaderData, NowData, MenuEntry, SettingsData, Bridge, Toggle, Segmented, Field,
     Icon, IconButton, PillButton, Seekbar, TrackRow, LinkText, ShelfList, ClampText, Shape,
 } from "components.slint";
 
-export { Bridge, CardData, TrackData, ShelfData, HeaderData, NowData }
+export { Bridge, Theme, Icons, CardData, TrackData, ShelfData, HeaderData, NowData, MenuEntry, SettingsData }
 
 component NavItem inherits Rectangle {
     in property <string> icon;
@@ -56,6 +56,347 @@ component NavItem inherits Rectangle {
         mouse-cursor: pointer;
         clicked => {
             root.clicked();
+        }
+    }
+}
+
+component MenuRow inherits Rectangle {
+    in property <string> icon;
+    in property <string> label;
+    in property <bool> danger;
+    callback clicked;
+    height: 44px;
+    Shape {
+        radius: 6px;
+        fill-color: rta.has-hover ? Theme.hover : transparent;
+    }
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 14px;
+        if root.icon != "": VerticalLayout {
+            alignment: center;
+            Icon {
+                path: root.icon;
+                size: 22px;
+                tint: root.danger ? #ff6b6b : Theme.text2;
+            }
+        }
+        Text {
+            text: root.label;
+            color: root.danger ? #ff6b6b : Theme.text;
+            font-size: 15px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+
+    rta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+component SettingRow inherits HorizontalLayout {
+    in property <string> title;
+    in property <string> detail;
+    padding-top: 12px;
+    padding-bottom: 12px;
+    spacing: 24px;
+    VerticalLayout {
+        horizontal-stretch: 1;
+        alignment: center;
+        spacing: 3px;
+        Text {
+            text: root.title;
+            color: Theme.text;
+            font-size: 15px;
+            font-weight: 500;
+        }
+
+        if root.detail != "": Text {
+            text: root.detail;
+            color: Theme.text2;
+            font-size: 13px;
+            wrap: word-wrap;
+        }
+    }
+
+    VerticalLayout {
+        alignment: center;
+        @children
+    }
+}
+
+component SettingSection inherits VerticalLayout {
+    in property <string> title;
+    padding-top: 20px;
+    spacing: 0;
+    Text {
+        text: root.title;
+        color: Theme.text;
+        font-size: 20px;
+        font-weight: 700;
+    }
+
+    Rectangle {
+        height: 8px;
+    }
+
+    @children
+}
+
+component SettingsView inherits Rectangle {
+    in property <SettingsData> settings;
+    in property <[string]> regions;
+    in property <bool> signed-in;
+    background: Theme.bg;
+    TouchArea { }
+
+    ScrollView {
+        VerticalLayout {
+            padding-left: 48px;
+            padding-right: 48px;
+            padding-top: 16px;
+            padding-bottom: 48px;
+            alignment: start;
+            Text {
+                text: "Settings";
+                color: Theme.text;
+                font-size: 34px;
+                font-weight: 700;
+            }
+
+            SettingSection {
+                title: "Playback";
+                SettingRow {
+                    title: "Audio quality";
+                    detail: "Best picks Opus, or 256 kbps with YouTube Music Premium. Standard always uses 128 kbps AAC.";
+                    HorizontalLayout {
+                        alignment: end;
+                        Segmented {
+                            labels: ["Best", "Standard"];
+                            values: ["best", "standard"];
+                            value: root.settings.quality;
+                            picked(v) => {
+                                Bridge.setting("quality", v);
+                            }
+                        }
+                    }
+                }
+
+                SettingRow {
+                    title: "Autoplay";
+                    detail: "Keep playing similar songs when your queue ends.";
+                    Toggle {
+                        checked: root.settings.autoplay;
+                        toggled(on) => {
+                            Bridge.setting("autoplay", on ? "1" : "0");
+                        }
+                    }
+                }
+
+                SettingRow {
+                    title: "Prepare the next song";
+                    detail: "Downloads the next song in advance so skipping is instant.";
+                    Toggle {
+                        checked: root.settings.prefetch;
+                        toggled(on) => {
+                            Bridge.setting("prefetch", on ? "1" : "0");
+                        }
+                    }
+                }
+            }
+
+            SettingSection {
+                title: "Lyrics";
+                SettingRow {
+                    title: "Synced lyrics from LRCLIB";
+                    detail: "Looks up time-synced lyrics on lrclib.net, which receives the song's title and artist. When off, only YouTube Music's own lyrics are shown.";
+                    Toggle {
+                        checked: root.settings.lrclib;
+                        toggled(on) => {
+                            Bridge.setting("lrclib", on ? "1" : "0");
+                        }
+                    }
+                }
+
+                SettingRow {
+                    title: "Text size";
+                    HorizontalLayout {
+                        alignment: end;
+                        Segmented {
+                            labels: ["Small", "Medium", "Large"];
+                            values: ["16", "20", "26"];
+                            value: root.settings.lyrics-size;
+                            picked(v) => {
+                                Bridge.setting("lyrics-size", v);
+                            }
+                        }
+                    }
+                }
+            }
+
+            SettingSection {
+                title: "Appearance";
+                SettingRow {
+                    title: "Accent color";
+                    detail: "Used for the progress bar and switches.";
+                    HorizontalLayout {
+                        spacing: 10px;
+                        alignment: end;
+                        for c in ["#ff0000", "#ff4f8b", "#a259ff", "#3ea6ff", "#2bd576", "#ff9a1f"]: Rectangle {
+                            width: 30px;
+                            height: 30px;
+                            Shape {
+                                radius: 15px;
+                                fill-color: c == "#ff0000" ? #ff0000 : c == "#ff4f8b" ? #ff4f8b : c == "#a259ff" ? #a259ff : c == "#3ea6ff" ? #3ea6ff : c == "#2bd576" ? #2bd576 : #ff9a1f;
+                                stroke-color: root.settings.accent == c ? #ffffff : transparent;
+                                stroke-w: 2px;
+                            }
+
+                            TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    Bridge.setting("accent", c);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            SettingSection {
+                title: "Region";
+                SettingRow {
+                    title: "Content region";
+                    detail: "Home, Explore and charts follow this region.";
+                    ComboBox {
+                        width: 200px;
+                        model: root.regions;
+                        current-value: root.settings.region;
+                        selected(v) => {
+                            Bridge.setting("region", v);
+                        }
+                    }
+                }
+            }
+
+            SettingSection {
+                title: "Windows";
+                SettingRow {
+                    title: "Close button keeps Yusic in the tray";
+                    detail: "When off, closing the window quits Yusic.";
+                    Toggle {
+                        checked: root.settings.close-to-tray;
+                        toggled(on) => {
+                            Bridge.setting("close-to-tray", on ? "1" : "0");
+                        }
+                    }
+                }
+
+                SettingRow {
+                    title: "Start with Windows";
+                    Toggle {
+                        checked: root.settings.start-with-windows;
+                        toggled(on) => {
+                            Bridge.setting("start-with-windows", on ? "1" : "0");
+                        }
+                    }
+                }
+
+                SettingRow {
+                    title: "Start minimized to the tray";
+                    detail: "When Yusic starts with Windows.";
+                    Toggle {
+                        checked: root.settings.start-minimized;
+                        toggled(on) => {
+                            Bridge.setting("start-minimized", on ? "1" : "0");
+                        }
+                    }
+                }
+
+                SettingRow {
+                    title: "Game mode";
+                    detail: "Stops redrawing the window while a fullscreen game covers it. On another monitor, Yusic keeps updating.";
+                    Toggle {
+                        checked: root.settings.game-mode;
+                        toggled(on) => {
+                            Bridge.setting("game-mode", on ? "1" : "0");
+                        }
+                    }
+                }
+            }
+
+            SettingSection {
+                title: "Updates";
+                SettingRow {
+                    title: "Update Yusic automatically";
+                    detail: root.settings.installed ? "Installs new releases from GitHub in the background." : "This copy is a development build; it isn't updated from GitHub.";
+                    Toggle {
+                        checked: root.settings.auto-update;
+                        toggled(on) => {
+                            Bridge.setting("auto-update", on ? "1" : "0");
+                        }
+                    }
+                }
+
+                SettingRow {
+                    title: "Yusic " + root.settings.version;
+                    PillButton {
+                        text: "Check for updates";
+                        clicked => {
+                            Bridge.check-updates();
+                        }
+                    }
+                }
+
+                SettingRow {
+                    title: "yt-dlp";
+                    detail: "Fetches the audio. It updates itself daily.";
+                    PillButton {
+                        text: "Update now";
+                        clicked => {
+                            Bridge.update-ytdlp();
+                        }
+                    }
+                }
+            }
+
+            SettingSection {
+                title: "Account";
+                SettingRow {
+                    title: root.signed-in ? "Signed in to YouTube Music" : "Not signed in";
+                    detail: "Your sign-in is stored encrypted on this PC.";
+                    PillButton {
+                        text: root.signed-in ? "Sign out" : "Sign in";
+                        clicked => {
+                            if root.signed-in {
+                                Bridge.sign-out();
+                            } else {
+                                Bridge.sign-in();
+                            }
+                        }
+                    }
+                }
+            }
+
+            SettingSection {
+                title: "About";
+                SettingRow {
+                    title: "Yusic";
+                    detail: "A lightweight YouTube Music client for Windows.";
+                    PillButton {
+                        text: "GitHub";
+                        clicked => {
+                            Bridge.open-url("https://github.com/Riqqqque/Yusic");
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -207,6 +548,31 @@ component CollectionHeader inherits VerticalLayout {
                 Bridge.radio-header();
             }
         }
+
+        if root.header.saveable: IconButton {
+            icon: root.header.saved ? Icons.library-saved : Icons.library-add;
+            size: 44px;
+            bordered: true;
+            clicked => {
+                Bridge.toggle-saved();
+            }
+        }
+        if root.header.owned: IconButton {
+            icon: Icons.edit;
+            size: 44px;
+            bordered: true;
+            clicked => {
+                Bridge.edit-playlist();
+            }
+        }
+        if root.header.owned: IconButton {
+            icon: Icons.delete;
+            size: 44px;
+            bordered: true;
+            clicked => {
+                Bridge.delete-playlist();
+            }
+        }
     }
 }
 
@@ -264,6 +630,13 @@ component ArtistHeader inherits Rectangle {
                     Bridge.radio-header();
                 }
             }
+
+            if root.header.subscribable: PillButton {
+                text: root.header.subscribed ? "Subscribed" : "Subscribe";
+                clicked => {
+                    Bridge.toggle-subscribed();
+                }
+            }
         }
     }
 }
@@ -295,6 +668,7 @@ component NpTab inherits Rectangle {
 }
 
 component LyricsView inherits Rectangle {
+    in property <length> font-size: 20px;
     in property <[string]> lines;
     in property <int> active: -1;
     in property <bool> synced;
@@ -320,7 +694,7 @@ component LyricsView inherits Rectangle {
                     width: parent.width;
                     text: line == "" ? "\u{266A}" : line;
                     wrap: word-wrap;
-                    font-size: 20px;
+                    font-size: root.font-size;
                     font-weight: 700;
                     color: !root.synced ? Theme.text : self.is-active-line ? Theme.text : (i < root.active ? Theme.text3 : Theme.text2);
                     property <bool> is-active-line: parent.is-active;
@@ -361,6 +735,7 @@ component NowPlayingView inherits Rectangle {
     in property <bool> lyrics-synced;
     in property <string> lyrics-state;
     in property <string> lyrics-source;
+    in property <int> lyrics-size: 20;
     background: Theme.bg;
     TouchArea { }
 
@@ -424,10 +799,14 @@ component NowPlayingView inherits Rectangle {
                         clicked => {
                             Bridge.queue-clicked(i);
                         }
+                        menu(x, y) => {
+                            Bridge.queue-menu(i, x, y);
+                        }
                     }
                 }
             }
             if root.tab == 1 && root.lyrics-state == "ready": LyricsView {
+                font-size: root.lyrics-size * 1px;
                 lines: root.lyrics-lines;
                 active: root.lyrics-active;
                 synced: root.lyrics-synced;
@@ -470,6 +849,8 @@ component PlayerBar inherits Rectangle {
     in property <bool> shuffle;
     in property <int> repeat-mode;
     in-out property <bool> np-open;
+    // Narrow windows: tighter side groups so the song title keeps some room.
+    in property <bool> compact;
     background: Theme.surface;
     height: Theme.playerbar;
     TouchArea {
@@ -483,7 +864,7 @@ component PlayerBar inherits Rectangle {
         padding-right: 16px;
         spacing: 8px;
         HorizontalLayout {
-            width: 280px;
+            width: root.compact ? 236px : 280px;
             alignment: start;
             spacing: 4px;
             VerticalLayout {
@@ -538,7 +919,7 @@ component PlayerBar inherits Rectangle {
         HorizontalLayout {
             horizontal-stretch: 1;
             alignment: center;
-            spacing: 16px;
+            spacing: root.compact ? 8px : 16px;
             VerticalLayout {
                 alignment: center;
                 Rectangle {
@@ -580,12 +961,12 @@ component PlayerBar inherits Rectangle {
                         }
                     }
 
-                    if root.now.album != "": Text {
+                    if root.now.album != "" && !root.compact: Text {
                         text: " • ";
                         color: Theme.text2;
                         font-size: 14px;
                     }
-                    if root.now.album != "": LinkText {
+                    if root.now.album != "" && !root.compact: LinkText {
                         text: root.now.album;
                         font-size: 14px;
                         overflow: elide;
@@ -596,10 +977,49 @@ component PlayerBar inherits Rectangle {
                     }
                 }
             }
+
+            HorizontalLayout {
+                spacing: 2px;
+                VerticalLayout {
+                    alignment: center;
+                    IconButton {
+                        icon: root.now.rating == 2 ? Icons.thumb-down-filled : Icons.thumb-down;
+                        icon-size: 22px;
+                        tint: root.now.rating == 2 ? Theme.text : Theme.text2;
+                        clicked => {
+                            Bridge.rate(root.now.rating == 2 ? 0 : 2);
+                        }
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    IconButton {
+                        icon: root.now.rating == 1 ? Icons.thumb-up-filled : Icons.thumb-up;
+                        icon-size: 22px;
+                        tint: root.now.rating == 1 ? Theme.text : Theme.text2;
+                        clicked => {
+                            Bridge.rate(root.now.rating == 1 ? 0 : 1);
+                        }
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    more-btn := IconButton {
+                        icon: Icons.more;
+                        icon-size: 22px;
+                        tint: Theme.text2;
+                        clicked => {
+                            Bridge.now-menu(self.absolute-position.x, self.absolute-position.y);
+                        }
+                    }
+                }
+            }
         }
 
         HorizontalLayout {
-            width: 280px;
+            width: root.compact ? 244px : 280px;
             alignment: end;
             spacing: 4px;
             VerticalLayout {
@@ -616,7 +1036,7 @@ component PlayerBar inherits Rectangle {
             VerticalLayout {
                 alignment: center;
                 Seekbar {
-                    width: 88px;
+                    width: root.compact ? 64px : 88px;
                     value: root.volume;
                     fill: Theme.text;
                     always-knob: true;
@@ -680,7 +1100,7 @@ export component AppWindow inherits Window {
     default-font-family: Theme.font;
     preferred-width: 1280px;
     preferred-height: 820px;
-    min-width: 760px;
+    min-width: 840px;
     min-height: 480px;
 
     // navigation / page
@@ -715,11 +1135,36 @@ export component AppWindow inherits Window {
     // account
     in property <bool> signed-in;
     in property <[CardData]> side-playlists;
+    // Playlists songs can be saved to (no Liked music).
+    in property <[CardData]> pick-playlists;
+    in property <bool> pick-loading;
     in-out property <bool> account-open;
     in property <string> toast;
 
     // a newer version is on disk
     in property <bool> update-ready;
+
+    // Flipped to force one full repaint (see win::full_repaint).
+    in property <bool> repaint-flip;
+
+    // context menu
+    in property <[MenuEntry]> menu-items;
+    in-out property <bool> menu-open;
+    in property <length> menu-x;
+    in property <length> menu-y;
+
+    // dialogs: "" | "playlist" | "pick-playlist" | "confirm"
+    in-out property <string> dialog;
+    in property <string> dialog-heading;
+    in property <string> dialog-message;
+    in property <string> dialog-ok;
+    in-out property <string> dialog-name;
+    in-out property <string> dialog-desc;
+    in-out property <string> dialog-privacy: "private";
+
+    // settings page
+    in-out property <SettingsData> settings;
+    in property <[string]> regions;
 
     // lyrics (Now Playing panel, tab 1)
     in-out property <int> np-tab: 0;
@@ -736,7 +1181,21 @@ export component AppWindow inherits Window {
         Bridge.np-changed();
     }
 
-    property <length> side-w: sidebar-wide ? Theme.sidebar-wide : Theme.sidebar-narrow;
+    // Below 1000px the sidebar collapses (like YouTube Music); the menu
+    // button then opens it just for the moment.
+    in-out property <bool> narrow-open: false;
+    property <bool> narrow: false;
+    changed width => {
+        root.narrow = root.width < 1000px;
+    }
+    property <bool> side-open: root.narrow ? root.narrow-open : root.sidebar-wide;
+    property <length> side-w: side-open ? Theme.sidebar-wide : Theme.sidebar-narrow;
+
+    // Nearly invisible full-window layer. Changing it marks the whole window
+    // as changed, so the partial renderer repaints everything once.
+    Rectangle {
+        background: root.repaint-flip ? #00000001 : #00000002;
+    }
 
     VerticalLayout {
         // top bar
@@ -753,12 +1212,16 @@ export component AppWindow inherits Window {
                     IconButton {
                         icon: Icons.menu;
                         clicked => {
-                            root.sidebar-wide = !root.sidebar-wide;
+                            if !root.narrow {
+                                root.sidebar-wide = !root.sidebar-wide;
+                            } else {
+                                root.narrow-open = !root.narrow-open;
+                            }
                         }
                     }
                 }
 
-                if root.sidebar-wide: Logo { }
+                if root.side-open: Logo { }
             }
 
             VerticalLayout {
@@ -820,6 +1283,7 @@ export component AppWindow inherits Window {
 
                             if root.search-text == "": Text {
                                 x: 0;
+                                width: parent.width;
                                 text: "Search songs, albums, artists, podcasts";
                                 color: Theme.text3;
                                 font-size: 16px;
@@ -872,7 +1336,7 @@ export component AppWindow inherits Window {
                 NavItem {
                     icon: Icons.home;
                     label: "Home";
-                    wide: root.sidebar-wide;
+                    wide: root.side-open;
                     selected: root.section == "home";
                     clicked => {
                         Bridge.navigate("home", "");
@@ -882,7 +1346,7 @@ export component AppWindow inherits Window {
                 NavItem {
                     icon: Icons.explore;
                     label: "Explore";
-                    wide: root.sidebar-wide;
+                    wide: root.side-open;
                     selected: root.section == "explore";
                     clicked => {
                         Bridge.navigate("explore", "");
@@ -892,18 +1356,28 @@ export component AppWindow inherits Window {
                 NavItem {
                     icon: Icons.library;
                     label: "Library";
-                    wide: root.sidebar-wide;
+                    wide: root.side-open;
                     selected: root.section == "library";
                     clicked => {
                         Bridge.navigate("library", "");
                     }
                 }
 
-                if root.sidebar-wide: Rectangle {
+                NavItem {
+                    icon: Icons.settings;
+                    label: "Settings";
+                    wide: root.side-open;
+                    selected: root.section == "settings";
+                    clicked => {
+                        Bridge.open-settings();
+                    }
+                }
+
+                if root.side-open: Rectangle {
                     height: 1px;
                     background: Theme.divider;
                 }
-                if root.sidebar-wide && !root.signed-in: VerticalLayout {
+                if root.side-open && !root.signed-in: VerticalLayout {
                     padding: 16px;
                     spacing: 16px;
                     Text {
@@ -923,7 +1397,19 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-                if root.sidebar-wide && root.signed-in: ScrollView {
+                if root.side-open && root.signed-in: HorizontalLayout {
+                    padding-left: 12px;
+                    padding-top: 12px;
+                    alignment: start;
+                    PillButton {
+                        icon: Icons.add;
+                        text: "New playlist";
+                        clicked => {
+                            Bridge.new-playlist();
+                        }
+                    }
+                }
+                if root.side-open && root.signed-in: ScrollView {
                     vertical-stretch: 1;
                     VerticalLayout {
                         alignment: start;
@@ -933,7 +1419,7 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-                if !root.sidebar-wide || !root.signed-in: Rectangle {
+                if !root.side-open || !root.signed-in: Rectangle {
                     vertical-stretch: 1;
                 }
             }
@@ -981,6 +1467,7 @@ export component AppWindow inherits Window {
                                 color: Theme.text;
                                 font-size: 34px;
                                 font-weight: 700;
+                                overflow: elide;
                             }
                             ShelfList {
                                 shelves: root.shelves;
@@ -988,12 +1475,24 @@ export component AppWindow inherits Window {
                         }
                         if root.notice != "": VerticalLayout {
                             padding: 64px;
+                            spacing: 20px;
                             Text {
                                 text: root.notice;
                                 color: Theme.text2;
                                 font-size: 16px;
                                 wrap: word-wrap;
                                 horizontal-alignment: center;
+                            }
+
+                            if root.section == "library" && !root.signed-in: HorizontalLayout {
+                                alignment: center;
+                                PillButton {
+                                    text: "Sign in";
+                                    primary: true;
+                                    clicked => {
+                                        Bridge.sign-in();
+                                    }
+                                }
                             }
                         }
                         if root.error != "": VerticalLayout {
@@ -1042,6 +1541,11 @@ export component AppWindow inherits Window {
                     }
                 }
 
+                if root.section == "settings": SettingsView {
+                    settings: root.settings;
+                    regions: root.regions;
+                    signed-in: root.signed-in;
+                }
                 if root.np-open: NowPlayingView {
                     now: root.now;
                     queue: root.queue;
@@ -1051,11 +1555,13 @@ export component AppWindow inherits Window {
                     lyrics-synced: root.lyrics-synced;
                     lyrics-state: root.lyrics-state;
                     lyrics-source: root.lyrics-source;
+                    lyrics-size: root.settings.lyrics-size;
                 }
             }
         }
 
         if root.has-track: PlayerBar {
+            compact: root.narrow;
             now: root.now;
             playing: root.playing;
             buffering: root.buffering;
@@ -1088,29 +1594,185 @@ export component AppWindow inherits Window {
 
         menu := VerticalLayout {
             padding: 8px;
-            Rectangle {
-                height: 44px;
-                Shape {
-                    radius: 6px;
-                    fill-color: so.has-hover ? Theme.hover : transparent;
+            MenuRow {
+                icon: Icons.settings;
+                label: "Settings";
+                clicked => {
+                    root.account-open = false;
+                    Bridge.open-settings();
+                }
+            }
+
+            MenuRow {
+                icon: Icons.account;
+                label: "Sign out";
+                clicked => {
+                    root.account-open = false;
+                    Bridge.sign-out();
+                }
+            }
+        }
+    }
+
+    // context menu
+    if root.menu-open: TouchArea {
+        clicked => {
+            root.menu-open = false;
+        }
+        pointer-event(e) => {
+            if e.kind == PointerEventKind.down && e.button == PointerEventButton.right {
+                root.menu-open = false;
+            }
+        }
+    }
+    if root.menu-open: Rectangle {
+        x: max(8px, min(root.menu-x, root.width - self.width - 8px));
+        y: root.menu-y + self.height > root.height - 8px ? max(8px, root.menu-y - self.height) : root.menu-y;
+        width: 264px;
+        height: ctx.preferred-height;
+        Shape {
+            radius: 10px;
+            fill-color: #282828;
+            stroke-color: #ffffff1a;
+            stroke-w: 1px;
+        }
+
+        ctx := VerticalLayout {
+            padding: 8px;
+            for m in root.menu-items: MenuRow {
+                icon: m.icon;
+                label: m.label;
+                danger: m.danger;
+                clicked => {
+                    root.menu-open = false;
+                    Bridge.menu-action(m.id);
+                }
+            }
+        }
+    }
+
+    // dialogs
+    if root.dialog != "": Rectangle {
+        background: #000000a6;
+        TouchArea {
+            clicked => {
+                Bridge.dialog-cancel();
+            }
+        }
+    }
+    if root.dialog != "": Rectangle {
+        x: (root.width - self.width) / 2;
+        y: max(24px, (root.height - self.height) / 2);
+        width: min(480px, root.width - 48px);
+        height: dlg.preferred-height;
+        Shape {
+            radius: 14px;
+            fill-color: #212121;
+            stroke-color: #ffffff1a;
+            stroke-w: 1px;
+        }
+
+        // Clicks inside the dialog must not reach the backdrop (which cancels).
+        TouchArea { }
+
+        dlg := VerticalLayout {
+            padding: 24px;
+            spacing: 16px;
+            Text {
+                text: root.dialog-heading;
+                color: Theme.text;
+                font-size: 22px;
+                font-weight: 700;
+            }
+
+            if root.dialog == "confirm": Text {
+                text: root.dialog-message;
+                color: Theme.text2;
+                font-size: 15px;
+                wrap: word-wrap;
+            }
+            if root.dialog == "playlist": Field {
+                text <=> root.dialog-name;
+                placeholder: "Title";
+                accepted => {
+                    Bridge.dialog-submit();
+                }
+            }
+            if root.dialog == "playlist": Field {
+                text <=> root.dialog-desc;
+                placeholder: "Description (optional)";
+            }
+            if root.dialog == "playlist": VerticalLayout {
+                spacing: 8px;
+                Text {
+                    text: "Privacy";
+                    color: Theme.text2;
+                    font-size: 13px;
                 }
 
                 HorizontalLayout {
-                    padding-left: 12px;
-                    spacing: 12px;
-                    Text {
-                        text: "Sign out";
-                        color: Theme.text;
-                        font-size: 15px;
-                        vertical-alignment: center;
+                    alignment: start;
+                    Segmented {
+                        labels: ["Private", "Unlisted", "Public"];
+                        values: ["private", "unlisted", "public"];
+                        value: root.dialog-privacy;
+                        picked(v) => {
+                            root.dialog-privacy = v;
+                        }
+                    }
+                }
+            }
+            if root.dialog == "pick-playlist": VerticalLayout {
+                spacing: 2px;
+                MenuRow {
+                    icon: Icons.add;
+                    label: "New playlist";
+                    clicked => {
+                        Bridge.new-playlist();
                     }
                 }
 
-                so := TouchArea {
-                    mouse-cursor: pointer;
+                Rectangle {
+                    // Leaves room for the heading and Cancel in short windows.
+                    height: min(360px, max(96px, root.height - 280px), picks.preferred-height);
+                    ScrollView {
+                        picks := VerticalLayout {
+                            alignment: start;
+                            if root.pick-loading: HorizontalLayout {
+                                alignment: center;
+                                padding: 16px;
+                                Spinner {
+                                    indeterminate: true;
+                                    width: 28px;
+                                    height: 28px;
+                                }
+                            }
+                            for p in root.pick-playlists: MenuRow {
+                                icon: p.subtitle != "" ? Icons.library-saved : Icons.queue-add;
+                                label: p.subtitle != "" ? p.title + "  (" + p.subtitle + ")" : p.title;
+                                clicked => {
+                                    Bridge.choose-playlist(p.id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            HorizontalLayout {
+                alignment: end;
+                spacing: 10px;
+                PillButton {
+                    text: "Cancel";
                     clicked => {
-                        root.account-open = false;
-                        Bridge.sign-out();
+                        Bridge.dialog-cancel();
+                    }
+                }
+
+                if root.dialog != "pick-playlist": PillButton {
+                    text: root.dialog-ok;
+                    primary: true;
+                    clicked => {
+                        Bridge.dialog-submit();
                     }
                 }
             }
@@ -1120,19 +1782,20 @@ export component AppWindow inherits Window {
     // update banner
     if root.update-ready: Rectangle {
         x: root.width - self.width - 24px;
-        y: Theme.topbar + 8px;
-        width: banner.preferred-width + 32px;
-        height: 52px;
+        y: root.height - (root.has-track ? Theme.playerbar : 0px) - self.height - 24px;
+        width: banner.preferred-width;
+        height: 56px;
         Shape {
-            radius: 10px;
+            radius: 12px;
             fill-color: #2a2a2a;
             stroke-color: #ffffff1a;
             stroke-w: 1px;
         }
 
         banner := HorizontalLayout {
-            x: 16px;
-            spacing: 14px;
+            padding-left: 20px;
+            padding-right: 10px;
+            spacing: 16px;
             Text {
                 text: "A new version of Yusic is ready";
                 color: Theme.text;
@@ -1156,7 +1819,7 @@ export component AppWindow inherits Window {
     // transient message
     if root.toast != "": Rectangle {
         x: (root.width - self.width) / 2;
-        y: root.height - (root.has-track ? Theme.playerbar : 0px) - self.height - 24px;
+        y: root.height - (root.has-track ? Theme.playerbar : 0px) - self.height - (root.update-ready ? 96px : 24px);
         width: min(toast-text.preferred-width + 40px, root.width - 80px);
         height: max(44px, toast-text.preferred-height + 20px);
         Shape {

@@ -63,6 +63,8 @@ pub struct Item {
     pub album: Option<Link>,
     pub duration: Option<u32>,
     pub wide: bool,
+    /// Position id inside a playlist (needed to remove the row).
+    pub set_video_id: Option<String>,
 }
 
 impl Item {
@@ -159,6 +161,20 @@ pub enum Continuation {
     Browse(String),
     /// More tracks of a playlist.
     Tracks(rustypipe::model::paginator::Paginator<rustypipe::model::TrackItem>),
+    /// More rows of a playlist read with our own InnerTube parser.
+    PlaylistRows(String),
+}
+
+/// What the signed-in user can do with the page's subject.
+#[derive(Clone, Debug, Default)]
+pub struct PageActions {
+    /// Playlist id to save/remove (albums and playlists).
+    pub library_id: Option<String>,
+    pub saved: Option<bool>,
+    /// The user's own playlist: rename, delete, remove songs.
+    pub owned_playlist: Option<String>,
+    pub channel_id: Option<String>,
+    pub subscribed: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -171,6 +187,7 @@ pub struct Page {
     /// Radio playlist id for the header's radio button.
     pub radio: Option<String>,
     pub notice: String,
+    pub actions: PageActions,
 }
 
 pub fn fmt_duration(secs: u32) -> String {

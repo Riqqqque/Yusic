@@ -42,7 +42,9 @@ pub fn find_ytdlp(data_dir: &Path) -> Option<PathBuf> {
     }
     candidates.push(tools_dir(data_dir).join("yt-dlp.exe"));
     // Development checkout.
-    candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("tools").join("yt-dlp.exe"));
+    if let Some(root) = crate::install::project_root() {
+        candidates.push(root.join("tools").join("yt-dlp.exe"));
+    }
     candidates.into_iter().find(|p| p.is_file()).or_else(|| on_path("yt-dlp.exe"))
 }
 
@@ -98,17 +100,25 @@ pub async fn install(data_dir: &Path, http: &reqwest::Client, progress: impl Fn(
             let tar = Path::new(&std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()))
                 .join("System32")
                 .join("tar.exe");
+            // Unpacked aside and moved in whole, so an interrupted unpack
+            // never leaves a broken deno.exe that later runs would pick up.
+            let staging = dir.join("deno-unpack");
+            let _ = std::fs::remove_dir_all(&staging);
+            std::fs::create_dir_all(&staging)?;
             let status = tokio::process::Command::new(tar)
                 .arg("-xf")
                 .arg(&zip)
                 .arg("-C")
-                .arg(&dir)
+                .arg(&staging)
                 .creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY)
                 .status()
                 .await?;
             let _ = std::fs::remove_file(&zip);
             let deno = dir.join("deno.exe");
-            if !status.success() || !deno.is_file() {
+            let unpacked = staging.join("deno.exe");
+            let moved = status.success() && unpacked.is_file() && std::fs::rename(&unpacked, &deno).is_ok();
+            let _ = std::fs::remove_dir_all(&staging);
+            if !moved || !deno.is_file() {
                 bail!("could not unpack Deno");
             }
             format!("deno:{}", deno.display())
@@ -148,7 +158,7 @@ async fn download_verified(http: &reqwest::Client, url: &str, sha256: &str, dest
 pub async fn update_ytdlp(ytdlp: &Path, data_dir: &Path) -> bool {
     let ours = ytdlp.starts_with(tools_dir(data_dir))
         || std::env::current_exe().ok().and_then(|e| e.parent().map(|d| ytdlp.starts_with(d))).unwrap_or(false)
-        || ytdlp.starts_with(Path::new(env!("CARGO_MANIFEST_DIR")));
+        || crate::install::project_root().is_some_and(|r| ytdlp.starts_with(r));
     if !ours {
         return false;
     }

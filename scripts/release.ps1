@@ -39,6 +39,7 @@ try {
     $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($built))
     $user = Split-Path $env:USERPROFILE -Leaf
     if ($text.Contains("\Users\$user\")) { throw "binary still contains the user profile path" }
+    if ($text.Contains($root)) { throw "binary still contains the source folder path" }
 
     $out = Join-Path $root 'target\publish\Yusic.exe'
     Copy-Item $built $out -Force
