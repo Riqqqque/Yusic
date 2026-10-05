@@ -27,10 +27,6 @@ target\release\yusic.exe
 
 Development builds look for `yt-dlp.exe` in `tools\` (gitignored) and use Node.js from `PATH`.
 
-`scriptselease.ps1 -Version x.y.z` builds the public exe (with local paths removed from the binary) and publishes it as a GitHub release.
-
-Development builds look for `yt-dlp.exe` in `tools\` (gitignored) and use Node.js from `PATH`.
-
 `scripts\release.ps1 -Version x.y.z` builds the public exe (with local paths removed from the binary) and publishes it as a GitHub release.
 
 `scripts\deploy.ps1` builds and installs `dist\yusic.exe`, which the desktop shortcut runs. It doesn't interrupt a running copy: the old exe is renamed aside, keeps playing, and gets cleaned up on a later start.
@@ -56,7 +52,9 @@ Closing the window hides Yusic to the tray, and playback continues. Quit from th
 | `--sign-in` | Open the sign-in window at startup |
 | `--lyrics` | Open the Now Playing panel on the Lyrics tab |
 
-`examples/` holds the feasibility spikes (stream resolution, MediaPlayer/SMTC, UI memory) and `smtc_list`, which lists Windows media sessions.
+Test runs (`--snapshot`, `--exit-after`) refuse to start next to a running Yusic unless `YUSIC_DATA_DIR` points them at their own folder.
+
+`examples/` holds the feasibility spikes (stream resolution, MediaPlayer/SMTC, UI memory), `smtc_list` (lists Windows media sessions), and read-only probes for lyrics, page timing and the "Save to playlist" list.
 
 ## Notes
 
@@ -64,5 +62,6 @@ Closing the window hides Yusic to the tray, and playback continues. Quit from th
 - rustypipe's combined search mis-parses song rows, so songs and videos come from the filtered searches.
 - Audio: the best format available is chosen, in this order: 256 kbps Opus/AAC (YouTube Music Premium, when signed in), ~160 kbps Opus, then 128 kbps AAC. If Windows can't decode a file, that track is fetched again as AAC.
 - Lyrics: time-synced lyrics come from [LRCLIB](https://lrclib.net), with YouTube Music's own lyrics as a fallback. Covers and re-uploads get the original song's words without the timing.
-- Likes and playlist editing are not implemented yet.
+- When signed in: like or dislike songs (player bar), create, edit and delete playlists, save songs to playlists, remove songs from your own playlists, save albums and playlists to your library, and subscribe to artists. Right-click a song or card, or use its ⋮ button, for Play next, Add to queue, Start radio, Go to artist or album, and Copy link.
+- Settings (sidebar or account menu): audio quality, autoplay, preparing the next song, LRCLIB lyrics and text size, accent color, content region, close-to-tray, start with Windows, game mode, automatic updates, and account.
 - The app icon is drawn in code (`src/icon_raster.rs`). `build.rs` turns it into the `.ico` embedded in the exe.

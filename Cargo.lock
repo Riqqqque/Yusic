@@ -5242,6 +5242,7 @@ dependencies = [
  "const-field-offset",
  "i-slint-backend-linuxkms",
  "i-slint-backend-selector",
+ "i-slint-backend-winit",
  "i-slint-common",
  "i-slint-core",
  "i-slint-core-macros",
@@ -7510,7 +7511,7 @@ dependencies = [
 
 [[package]]
 name = "yusic"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "image",

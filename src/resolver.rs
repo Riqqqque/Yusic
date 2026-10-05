@@ -164,23 +164,30 @@ impl Resolver {
             .or_default()
             .clone();
         // Removes the in-flight entry when the last waiter finishes or is cancelled.
+        // Each waiter's last reference is dropped under the map lock, so the
+        // count is exact when two waiters finish at once.
         struct Done<'a> {
             map: &'a Mutex<HashMap<String, Arc<OnceCell<PathBuf>>>>,
             id: &'a str,
-            cell: Arc<OnceCell<PathBuf>>,
+            cell: Option<Arc<OnceCell<PathBuf>>>,
         }
         impl Drop for Done<'_> {
             fn drop(&mut self) {
                 let mut map = self.map.lock().unwrap();
-                let last = map.get(self.id).is_some_and(|c| Arc::ptr_eq(c, &self.cell))
-                    && Arc::strong_count(&self.cell) == 2;
-                if last {
-                    map.remove(self.id);
+                let cell = self.cell.take();
+                if let Some(c) = &cell {
+                    if map.get(self.id).is_some_and(|m| Arc::ptr_eq(m, c)) && Arc::strong_count(c) == 2 {
+                        map.remove(self.id);
+                    }
                 }
+                drop(cell);
+                drop(map);
             }
         }
-        let done = Done { map: &self.inflight, id: &stem, cell };
-        let res = done.cell.get_or_try_init(|| self.fetch(id, &stem, cookie, quality)).await.cloned();
+        let done = Done { map: &self.inflight, id: &stem, cell: Some(cell) };
+        let cell = done.cell.clone().expect("set above");
+        let res = cell.get_or_try_init(|| self.fetch(id, &stem, cookie, quality)).await.cloned();
+        drop(cell);
         drop(done);
         // Finished after the user moved on: don't leave it lying around.
         // The lock is held so a concurrent retain() can't re-add the id in between.

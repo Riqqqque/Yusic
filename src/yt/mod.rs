@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use crate::auth::{self, CookieStore, ProtectedStorage};
 
 use crate::model::{
-    Continuation, Header, Item, Kind, Link, Page, Shelf, ShelfKind, fmt_count,
+    Continuation, Header, Item, Kind, Link, Page, PageActions, Shelf, ShelfKind, fmt_count,
 };
 
 const FALLBACK_CLIENT_VERSION: &str = "1.20260928.13.00";
@@ -34,6 +34,42 @@ pub struct Yt {
     cache: ProtectedStorage,
     cookies: CookieStore,
     cookie: RwLock<Option<String>>,
+    /// Content region (ISO country code), e.g. "US".
+    region: RwLock<String>,
+    /// Look up synced lyrics on LRCLIB (sends title/artist there).
+    pub use_lrclib: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rating {
+    None,
+    Like,
+    Dislike,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Privacy {
+    Private,
+    Unlisted,
+    Public,
+}
+
+impl Privacy {
+    pub fn from_str(s: &str) -> Privacy {
+        match s {
+            "public" => Privacy::Public,
+            "unlisted" => Privacy::Unlisted,
+            _ => Privacy::Private,
+        }
+    }
+
+    fn api(self) -> &'static str {
+        match self {
+            Privacy::Private => "PRIVATE",
+            Privacy::Unlisted => "UNLISTED",
+            Privacy::Public => "PUBLIC",
+        }
+    }
 }
 
 impl Yt {
@@ -48,14 +84,35 @@ impl Yt {
             .storage_dir(&storage)
             .storage(Box::new(ProtectedStorage(cache_path.clone())))
             .no_botguard()
+            // Error reports hold whole responses (including the user's
+            // library) in plain text; don't write them.
+            .no_reporter()
             .build()?;
+        let _ = std::fs::remove_dir_all(storage.join("rustypipe_reports"));
         let cookies = CookieStore(data_dir.join("auth.bin"));
         let cookie = RwLock::new(cookies.load());
-        Ok(Self { rp, http, cache: ProtectedStorage(cache_path), cookies, cookie })
+        Ok(Self {
+            rp,
+            http,
+            cache: ProtectedStorage(cache_path),
+            cookies,
+            cookie,
+            region: RwLock::new("US".into()),
+            use_lrclib: std::sync::atomic::AtomicBool::new(true),
+        })
     }
 
     fn q(&self) -> RustyPipeQuery {
-        self.rp.query()
+        let region = self.region.read().unwrap().clone();
+        let q = self.rp.query();
+        match serde_json::from_value::<rustypipe::param::Country>(json!(region)) {
+            Ok(c) => q.country(c),
+            Err(_) => q,
+        }
+    }
+
+    pub fn set_region(&self, code: &str) {
+        *self.region.write().unwrap() = code.to_uppercase();
     }
 
     pub fn signed_in(&self) -> bool {
@@ -115,22 +172,35 @@ impl Yt {
             .unwrap_or_else(|| FALLBACK_CLIENT_VERSION.to_owned())
     }
 
+    /// POST `browse` with `{"continuation": token}` (newer continuation style).
+    async fn innertube_continue(&self, token: &str) -> Result<Value> {
+        self.innertube_post(json!({ "continuation": token }), None).await
+    }
+
     async fn innertube_browse(&self, browse_id: Option<&str>, ctoken: Option<&str>) -> Result<Value> {
-        let mut url = String::from("https://music.youtube.com/youtubei/v1/browse?prettyPrint=false");
-        if let Some(t) = ctoken {
-            url.push_str(&format!("&ctoken={t}&continuation={t}&type=next"));
-        }
-        let mut body = json!({
-            "context": { "client": {
-                "clientName": "WEB_REMIX",
-                "clientVersion": self.client_version(),
-                "hl": "en",
-                "gl": "US",
-            }}
-        });
+        let mut body = json!({});
         if let Some(id) = browse_id {
             body["browseId"] = json!(id);
         }
+        self.innertube_post(body, ctoken).await
+    }
+
+    async fn innertube_post(&self, body: Value, ctoken: Option<&str>) -> Result<Value> {
+        self.innertube_call("browse", body, ctoken).await
+    }
+
+    /// POST to any InnerTube endpoint (e.g. `like/like`) as the web client.
+    async fn innertube_call(&self, endpoint: &str, mut body: Value, ctoken: Option<&str>) -> Result<Value> {
+        let mut url = format!("https://music.youtube.com/youtubei/v1/{endpoint}?prettyPrint=false");
+        if let Some(t) = ctoken {
+            url.push_str(&format!("&ctoken={t}&continuation={t}&type=next"));
+        }
+        body["context"] = json!({ "client": {
+            "clientName": "WEB_REMIX",
+            "clientVersion": self.client_version(),
+            "hl": "en",
+            "gl": self.region.read().unwrap().clone(),
+        }});
         let mut req = self
             .http
             .post(url)
@@ -191,7 +261,16 @@ impl Yt {
     }
 
     pub async fn album(&self, id: &str) -> Result<Page> {
-        let a = self.q().music_album(id).await.context("could not load album")?;
+        let q = self.q();
+        let (a, page) = tokio::join!(q.music_album(id), async {
+            if self.signed_in() { self.innertube_browse(Some(id), None).await.ok() } else { None }
+        });
+        let a = a.context("could not load album")?;
+        let actions = PageActions {
+            library_id: if self.signed_in() { a.playlist_id.clone() } else { None },
+            saved: page.as_ref().and_then(browse::library_toggle),
+            ..Default::default()
+        };
         let album_link = Link { name: a.name.clone(), id: Some(a.id.clone()) };
         let tracks: Vec<Item> = a
             .tracks
@@ -230,11 +309,63 @@ impl Yt {
             radio: tracks.first().map(|t| format!("RDAMVM{}", t.id)),
             play: tracks,
             shelves,
+            actions,
             ..Default::default()
         })
     }
 
     pub async fn playlist(&self, id: &str) -> Result<Page> {
+        // rustypipe rejects playlists that YouTube now lays out like albums
+        // (most personal playlists), so read the page ourselves first.
+        match self.playlist_innertube(id).await {
+            Ok(p) => Ok(p),
+            Err(own) => self.playlist_rustypipe(id).await.map_err(|e| own.context(format!("{e:#}"))),
+        }
+    }
+
+    async fn playlist_innertube(&self, id: &str) -> Result<Page> {
+        let v = self.innertube_browse(Some(&format!("VL{id}")), None).await?;
+        let p = browse::parse_playlist(&v).context("unexpected playlist page")?;
+        if p.items.is_empty() && p.title.is_empty() {
+            anyhow::bail!("empty playlist page");
+        }
+        let signed_in = self.signed_in();
+        let actions = PageActions {
+            library_id: (signed_in && !p.owned).then(|| id.to_owned()),
+            saved: if signed_in { p.saved } else { None },
+            owned_playlist: (p.owned && id != "LM").then(|| id.to_owned()),
+            ..Default::default()
+        };
+        Ok(Page {
+            actions,
+            header: Header::Collection {
+                title: p.title,
+                line1: p.subtitle,
+                line2: p.second_subtitle,
+                description: p.description,
+                thumb: p.thumb,
+                round: false,
+            },
+            radio: p.items.first().map(|t| format!("RDAMVM{}", t.id)),
+            play: p.items.clone(),
+            shelves: vec![Shelf { title: String::new(), kind: ShelfKind::TrackList, items: p.items }],
+            continuation: p.continuation.map(Continuation::PlaylistRows),
+            ..Default::default()
+        })
+    }
+
+    pub async fn playlist_more(&self, token: &str) -> Result<(Vec<Item>, Option<String>)> {
+        let v = self.innertube_continue(token).await?;
+        let (items, next) = browse::parse_playlist_continuation(&v);
+        if items.is_empty() && next.is_none() {
+            // Older style: ctoken query parameters.
+            let v = self.innertube_browse(None, Some(token)).await?;
+            return Ok(browse::parse_playlist_continuation(&v));
+        }
+        Ok((items, next))
+    }
+
+    async fn playlist_rustypipe(&self, id: &str) -> Result<Page> {
         let p = if self.signed_in() {
             match self.q().authenticated().music_playlist(id).await {
                 Ok(p) => p,
@@ -285,7 +416,17 @@ impl Yt {
     }
 
     pub async fn artist(&self, id: &str) -> Result<Page> {
-        let a = self.q().music_artist(id, false).await.context("could not load artist")?;
+        let q = self.q();
+        let (a, page) = tokio::join!(q.music_artist(id, false), async {
+            if self.signed_in() { self.innertube_browse(Some(id), None).await.ok() } else { None }
+        });
+        let a = a.context("could not load artist")?;
+        let sub = page.as_ref().and_then(browse::subscription);
+        let actions = PageActions {
+            channel_id: sub.as_ref().map(|s| s.0.clone()),
+            subscribed: sub.map(|s| s.1),
+            ..Default::default()
+        };
         let top: Vec<Item> = a.tracks.iter().map(track_item).collect();
         let mut shelves = Vec::new();
         if !top.is_empty() {
@@ -333,6 +474,7 @@ impl Yt {
             radio: a.radio_id.clone(),
             play: top,
             shelves,
+            actions,
             ..Default::default()
         })
     }
@@ -467,13 +609,158 @@ impl Yt {
                 source: l.footer.trim().trim_start_matches("Source:").trim().to_string(),
             })
         };
-        let (lrc, ytm) = tokio::join!(lyrics::lrclib(&self.http, &info), ytm);
-        let lrc = lrc.ok().flatten();
+        let use_lrclib = self.use_lrclib.load(std::sync::atomic::Ordering::Relaxed);
+        let lrc = async {
+            if use_lrclib { lyrics::lrclib(&self.http, &info).await.ok().flatten() } else { None }
+        };
+        let (lrc, ytm) = tokio::join!(lrc, ytm);
         Ok(match (lrc, ytm) {
             (Some(l), _) if matches!(l.body, lyrics::LyricsBody::Synced(_)) => Some(l),
             (_, Some(y)) => Some(y),
             (l, None) => l,
         })
+    }
+
+    // ------------------------------------------------------------ account actions
+
+    fn require_sign_in(&self) -> Result<()> {
+        if self.signed_in() { Ok(()) } else { anyhow::bail!("Sign in first") }
+    }
+
+    pub async fn rating(&self, video_id: &str) -> Result<Rating> {
+        self.require_sign_in()?;
+        let v = self.innertube_call("next", json!({ "videoId": video_id, "isAudioOnly": true }), None).await?;
+        Ok(match browse::like_status(&v).as_deref() {
+            Some("LIKE") => Rating::Like,
+            Some("DISLIKE") => Rating::Dislike,
+            _ => Rating::None,
+        })
+    }
+
+    pub async fn rate(&self, video_id: &str, rating: Rating) -> Result<()> {
+        self.require_sign_in()?;
+        let endpoint = match rating {
+            Rating::Like => "like/like",
+            Rating::Dislike => "like/dislike",
+            Rating::None => "like/removelike",
+        };
+        self.innertube_call(endpoint, json!({ "target": { "videoId": video_id } }), None).await?;
+        Ok(())
+    }
+
+    /// Saves (or removes) an album/playlist in the library.
+    pub async fn set_saved(&self, playlist_id: &str, saved: bool) -> Result<()> {
+        self.require_sign_in()?;
+        let endpoint = if saved { "like/like" } else { "like/removelike" };
+        self.innertube_call(endpoint, json!({ "target": { "playlistId": playlist_id } }), None).await?;
+        Ok(())
+    }
+
+    pub async fn set_subscribed(&self, channel_id: &str, on: bool) -> Result<()> {
+        self.require_sign_in()?;
+        let endpoint = if on { "subscription/subscribe" } else { "subscription/unsubscribe" };
+        self.innertube_call(endpoint, json!({ "channelIds": [channel_id] }), None).await?;
+        Ok(())
+    }
+
+    /// Creates a playlist and returns its id.
+    pub async fn create_playlist(&self, title: &str, description: &str, privacy: Privacy, video_ids: &[String]) -> Result<String> {
+        self.require_sign_in()?;
+        let mut body = json!({ "title": title, "description": description, "privacyStatus": privacy.api() });
+        if !video_ids.is_empty() {
+            body["videoIds"] = json!(video_ids);
+        }
+        let v = self.innertube_call("playlist/create", body, None).await?;
+        v.get("playlistId").and_then(Value::as_str).map(str::to_owned).context("YouTube didn't create the playlist")
+    }
+
+    /// Renames/re-describes a playlist; privacy only changes when given.
+    pub async fn edit_playlist(&self, playlist_id: &str, title: &str, description: &str, privacy: Option<Privacy>) -> Result<()> {
+        self.require_sign_in()?;
+        let mut actions = vec![
+            json!({ "action": "ACTION_SET_PLAYLIST_NAME", "playlistName": title }),
+            json!({ "action": "ACTION_SET_PLAYLIST_DESCRIPTION", "playlistDescription": description }),
+        ];
+        if let Some(p) = privacy {
+            actions.push(json!({ "action": "ACTION_SET_PLAYLIST_PRIVACY", "playlistPrivacy": p.api() }));
+        }
+        let v = self.edit(playlist_id, json!(actions)).await?;
+        succeeded(&v)
+    }
+
+    pub async fn delete_playlist(&self, playlist_id: &str) -> Result<()> {
+        self.require_sign_in()?;
+        self.innertube_call("playlist/delete", json!({ "playlistId": playlist_id }), None).await?;
+        Ok(())
+    }
+
+    /// Adds songs. Ok(false) when YouTube reports they're already in the playlist.
+    pub async fn add_to_playlist(&self, playlist_id: &str, video_ids: &[String]) -> Result<bool> {
+        self.require_sign_in()?;
+        // Same as the web client: duplicates are refused (with a confirmation
+        // prompt there) instead of being added twice.
+        let actions: Vec<Value> = video_ids
+            .iter()
+            .map(|v| json!({ "action": "ACTION_ADD_VIDEO", "addedVideoId": v, "dedupeOption": "DEDUPE_OPTION_CHECK" }))
+            .collect();
+        let v = self.edit(playlist_id, json!(actions)).await?;
+        if v.get("status").and_then(Value::as_str) == Some("STATUS_SUCCEEDED") {
+            return Ok(true);
+        }
+        let message = browse::find_key(&v, "dialogMessages")
+            .or_else(|| browse::find_key(&v, "responseText"))
+            .map(|m| match m.as_array() {
+                Some(list) => list.iter().map(|x| browse::runs_text(Some(x))).collect::<Vec<_>>().join(" "),
+                None => browse::runs_text(Some(m)),
+            })
+            .unwrap_or_default();
+        let duplicate = browse::find_key(&v, "confirmDialogRenderer").is_some()
+            || browse::find_key(&v, "confirmDialogEndpoint").is_some()
+            || message.to_lowercase().contains("already");
+        if duplicate {
+            return Ok(false);
+        }
+        if !message.is_empty() {
+            anyhow::bail!("{message}");
+        }
+        succeeded(&v).map(|_| true)
+    }
+
+    pub async fn remove_from_playlist(&self, playlist_id: &str, video_id: &str, set_video_id: &str) -> Result<()> {
+        self.require_sign_in()?;
+        let actions = json!([{ "action": "ACTION_REMOVE_VIDEO", "removedVideoId": video_id, "setVideoId": set_video_id }]);
+        let v = self.edit(playlist_id, actions).await?;
+        succeeded(&v)
+    }
+
+    async fn edit(&self, playlist_id: &str, actions: Value) -> Result<Value> {
+        self.innertube_call("browse/edit_playlist", json!({ "playlistId": playlist_id, "actions": actions }), None).await
+    }
+
+    /// Playlists the songs can be added to (the user's own), as
+    /// (id, title, already contains all of them).
+    pub async fn add_targets(&self, video_ids: &[String]) -> Result<Vec<(String, String, bool)>> {
+        self.require_sign_in()?;
+        let v = self.innertube_call("playlist/get_add_to_playlist", json!({ "videoIds": video_ids }), None).await?;
+        let mut out = Vec::new();
+        if let Some(list) = browse::find_key(&v, "playlists").and_then(Value::as_array) {
+            for p in list {
+                let Some(r) = p.get("playlistAddToOptionRenderer") else { continue };
+                let Some(id) = r.get("playlistId").and_then(Value::as_str) else { continue };
+                if id == "LM" {
+                    continue;
+                }
+                let title = browse::runs_text(r.get("title"));
+                let contains = r.get("containsSelectedVideos").and_then(Value::as_str) == Some("ALL");
+                out.push((id.to_owned(), title, contains));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Metadata for a single track.
+    pub async fn track(&self, video_id: &str) -> Result<Item> {
+        Ok(track_item(&self.q().music_details(video_id).await?.track))
     }
 
     pub async fn suggestions(&self, query: &str) -> Result<Vec<String>> {
@@ -506,6 +793,16 @@ impl Yt {
             }
             _ => Vec::new(),
         })
+    }
+}
+
+/// Accepts a missing status only for calls that don't report one.
+fn succeeded(v: &Value) -> Result<()> {
+    match v.get("status").and_then(Value::as_str) {
+        Some("STATUS_SUCCEEDED") => Ok(()),
+        Some(other) => anyhow::bail!("YouTube refused the change ({other})"),
+        None if v.get("error").is_some() => anyhow::bail!("YouTube refused the change"),
+        None => Ok(()),
     }
 }
 

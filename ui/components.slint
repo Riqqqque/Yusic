@@ -31,6 +31,8 @@ export struct ShelfData {
     kind: string,
     cards: [CardData],
     tracks: [TrackData],
+    // Any row has an album (playlists without album info hide the column).
+    show-album: bool,
 }
 
 export struct HeaderData {
@@ -42,6 +44,12 @@ export struct HeaderData {
     description: string,
     image: image,
     round: bool,
+    // Signed-in actions
+    saveable: bool,
+    saved: bool,
+    owned: bool,
+    subscribable: bool,
+    subscribed: bool,
 }
 
 export struct NowData {
@@ -53,6 +61,32 @@ export struct NowData {
     art: image,
     artist-id: string,
     album-id: string,
+    // 0 none, 1 liked, 2 disliked
+    rating: int,
+}
+
+export struct MenuEntry {
+    id: string,
+    label: string,
+    icon: string,
+    danger: bool,
+}
+
+export struct SettingsData {
+    quality: string,
+    autoplay: bool,
+    prefetch: bool,
+    lrclib: bool,
+    lyrics-size: int,
+    close-to-tray: bool,
+    start-with-windows: bool,
+    start-minimized: bool,
+    game-mode: bool,
+    accent: string,
+    region: string,
+    auto-update: bool,
+    version: string,
+    installed: bool,
 }
 
 export global Bridge {
@@ -83,6 +117,28 @@ export global Bridge {
     callback account();
     callback toggle-mute();
     callback np-changed();
+    // context menus: (shelf, row | queue index, x, y) in window coordinates
+    callback track-menu(int, int, length, length);
+    callback queue-menu(int, length, length);
+    callback now-menu(length, length);
+    callback card-menu(CardData, length, length);
+    callback menu-action(string);
+    // account actions
+    callback rate(int);
+    callback toggle-saved();
+    callback toggle-subscribed();
+    callback new-playlist();
+    callback edit-playlist();
+    callback delete-playlist();
+    callback dialog-submit();
+    callback dialog-cancel();
+    callback choose-playlist(string);
+    // settings
+    callback open-settings();
+    callback setting(string, string);
+    callback check-updates();
+    callback update-ytdlp();
+    callback open-url(string);
     callback restart-update();
     callback lyric-clicked(int);
 }
@@ -278,9 +334,17 @@ export component ClampText inherits Rectangle {
     in property <int> font-weight: 400;
     in property <int> lines: 2;
     in property <TextHorizontalAlignment> align: left;
-    property <length> line: root.font-size * 1.34;
+    // Real line height of this font/size, measured from a one-line text.
+    property <length> line: probe.preferred-height;
     height: min(t.preferred-height, root.lines * root.line);
     clip: true;
+    probe := Text {
+        visible: false;
+        text: "Xg";
+        font-size: root.font-size;
+        font-weight: root.font-weight;
+    }
+
     t := Text {
         y: 0;
         width: parent.width;
@@ -367,6 +431,11 @@ export component Card inherits Rectangle {
                 Bridge.card-clicked(root.data);
             }
         }
+        pointer-event(e) => {
+            if e.kind == PointerEventKind.down && e.button == PointerEventButton.right {
+                Bridge.card-menu(root.data, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+            }
+        }
     }
 }
 
@@ -414,112 +483,256 @@ export component TrackRow inherits Rectangle {
     in property <TrackData> data;
     in property <bool> columns: false;
     in property <bool> numbered: false;
+    in property <bool> show-album: true;
     callback clicked;
+    // Context menu at (x, y) in window coordinates.
+    callback menu(length, length);
+    property <bool> hovered: ta.has-hover || mta.has-hover;
     height: 56px;
     border-radius: 4px;
-    background: ta.has-hover ? Theme.hover : transparent;
+    background: root.hovered ? Theme.hover : transparent;
+    // The row's content sits inside its hover area, so hovering the artist
+    // or album links (their own touch areas) keeps the row highlighted.
     ta := TouchArea {
         mouse-cursor: pointer;
         clicked => {
             root.clicked();
         }
-    }
-
-    HorizontalLayout {
-        padding-left: 8px;
-        padding-right: 16px;
-        spacing: 16px;
-        if root.numbered && !root.data.active && !ta.has-hover: Text {
-            width: 32px;
-            text: root.data.index;
-            color: Theme.text2;
-            font-size: 15px;
-            horizontal-alignment: center;
-            vertical-alignment: center;
+        pointer-event(e) => {
+            if e.kind == PointerEventKind.down && e.button == PointerEventButton.right {
+                root.menu(self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+            }
         }
-        if root.numbered && (root.data.active || ta.has-hover): HorizontalLayout {
-            width: 32px;
-            alignment: center;
-            VerticalLayout {
+
+        HorizontalLayout {
+            padding-left: 8px;
+            padding-right: 16px;
+            spacing: 16px;
+            if root.numbered && !root.data.active && !ta.has-hover: Text {
+                width: 32px;
+                text: root.data.index;
+                color: Theme.text2;
+                font-size: 15px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            if root.numbered && (root.data.active || ta.has-hover): HorizontalLayout {
+                width: 32px;
                 alignment: center;
-                Icon {
-                    path: root.data.active && !ta.has-hover ? Icons.radio : Icons.play;
-                    size: 22px;
+                VerticalLayout {
+                    alignment: center;
+                    Icon {
+                        path: root.data.active && !ta.has-hover ? Icons.radio : Icons.play;
+                        size: 22px;
+                    }
                 }
             }
-        }
-        if !root.numbered: VerticalLayout {
-            alignment: center;
-            Thumb {
-                source: root.data.image;
-                active: root.data.active;
-                hover: ta.has-hover;
+            if !root.numbered: VerticalLayout {
+                alignment: center;
+                Thumb {
+                    source: root.data.image;
+                    active: root.data.active;
+                    hover: ta.has-hover;
+                }
             }
-        }
-        if !root.columns: VerticalLayout {
-            alignment: center;
-            horizontal-stretch: 1;
-            spacing: 2px;
-            Text {
+            if !root.columns: VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 1;
+                spacing: 2px;
+                Text {
+                    text: root.data.title;
+                    color: Theme.text;
+                    font-size: 15px;
+                    font-weight: 500;
+                    overflow: elide;
+                }
+
+                Text {
+                    text: root.data.subtitle;
+                    color: Theme.text2;
+                    font-size: 14px;
+                    overflow: elide;
+                }
+            }
+            if root.columns: Text {
+                horizontal-stretch: 3;
+                min-width: 64px;
+                preferred-width: 0;
                 text: root.data.title;
                 color: Theme.text;
                 font-size: 15px;
                 font-weight: 500;
                 overflow: elide;
+                vertical-alignment: center;
+            }
+            if root.columns && root.data.artists != "": LinkText {
+                horizontal-stretch: 2;
+                min-width: 0px;
+                preferred-width: 0;
+                text: root.data.artists;
+                font-size: 15px;
+                overflow: elide;
+                vertical-alignment: center;
+                link: root.data.artist-id != "";
+                clicked => {
+                    Bridge.artist-clicked(root.data.artist-id);
+                }
+            }
+            if root.columns && !root.numbered && root.show-album: LinkText {
+                horizontal-stretch: 2;
+                min-width: 0px;
+                preferred-width: 0;
+                text: root.data.album;
+                font-size: 15px;
+                overflow: elide;
+                vertical-alignment: center;
+                link: root.data.album-id != "";
+                clicked => {
+                    Bridge.album-clicked(root.data.album-id);
+                }
+            }
+            // "More" button, shown on hover (space is always reserved).
+            Rectangle {
+                width: 36px;
+                mta := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        root.menu(self.absolute-position.x, self.absolute-position.y + self.height);
+                    }
+                }
+
+                if root.hovered: Rectangle {
+                    width: 36px;
+                    height: 36px;
+                    Shape {
+                        radius: 18px;
+                        fill-color: mta.has-hover ? Theme.pressed : transparent;
+                    }
+
+                    Icon {
+                        path: Icons.more;
+                        size: 22px;
+                        tint: Theme.text2;
+                    }
+                }
             }
 
             Text {
-                text: root.data.subtitle;
+                width: 44px;
+                text: root.data.duration;
                 color: Theme.text2;
                 font-size: 14px;
-                overflow: elide;
+                horizontal-alignment: right;
+                vertical-alignment: center;
             }
         }
-        if root.columns: Text {
-            horizontal-stretch: 3;
-            min-width: 120px;
-            preferred-width: 0;
-            text: root.data.title;
-            color: Theme.text;
-            font-size: 15px;
-            font-weight: 500;
-            overflow: elide;
-            vertical-alignment: center;
+    }
+}
+
+/// On/off switch.
+export component Toggle inherits Rectangle {
+    in property <bool> checked;
+    callback toggled(bool);
+    width: 42px;
+    height: 24px;
+    Shape {
+        radius: 12px;
+        fill-color: root.checked ? Theme.accent : #ffffff33;
+    }
+
+    Shape {
+        x: root.checked ? parent.width - 21px : 3px;
+        y: 3px;
+        width: 18px;
+        height: 18px;
+        radius: 9px;
+        fill-color: #ffffff;
+        animate x {
+            duration: 120ms;
+            easing: ease-out;
         }
-        if root.columns && root.data.artists != "": LinkText {
-            horizontal-stretch: 2;
-            min-width: 80px;
-            preferred-width: 0;
-            text: root.data.artists;
-            font-size: 15px;
-            overflow: elide;
-            vertical-alignment: center;
-            link: root.data.artist-id != "";
-            clicked => {
-                Bridge.artist-clicked(root.data.artist-id);
-            }
+    }
+
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.toggled(!root.checked);
         }
-        if root.columns && !root.numbered: LinkText {
-            horizontal-stretch: 2;
-            min-width: 80px;
-            preferred-width: 0;
-            text: root.data.album;
-            font-size: 15px;
-            overflow: elide;
-            vertical-alignment: center;
-            link: root.data.album-id != "";
-            clicked => {
-                Bridge.album-clicked(root.data.album-id);
-            }
+    }
+}
+
+/// A row of mutually exclusive choices.
+export component Segmented inherits HorizontalLayout {
+    in property <[string]> labels;
+    in property <[string]> values;
+    in property <string> value;
+    callback picked(string);
+    spacing: 6px;
+    for l[i] in root.labels: Rectangle {
+        property <bool> on: root.values[i] == root.value;
+        height: 34px;
+        width: lbl.preferred-width + 28px;
+        Shape {
+            radius: 17px;
+            fill-color: parent.on ? #ffffff : (sta.has-hover ? #ffffff26 : #ffffff14);
         }
-        Text {
-            width: 48px;
-            text: root.data.duration;
-            color: Theme.text2;
+
+        lbl := Text {
+            text: l;
+            color: parent.on ? #030303 : Theme.text;
             font-size: 14px;
-            horizontal-alignment: right;
+            font-weight: 600;
+            horizontal-alignment: center;
             vertical-alignment: center;
         }
+
+        sta := TouchArea {
+            mouse-cursor: pointer;
+            clicked => {
+                root.picked(root.values[i]);
+            }
+        }
+    }
+}
+
+/// Single-line text field with a placeholder.
+export component Field inherits Rectangle {
+    in-out property <string> text;
+    in property <string> placeholder;
+    callback accepted();
+    height: 44px;
+    Shape {
+        radius: 8px;
+        fill-color: #ffffff12;
+        stroke-color: input.has-focus ? Theme.text2 : #ffffff26;
+        stroke-w: 1px;
+    }
+
+    input := TextInput {
+        x: 14px;
+        width: parent.width - 28px;
+        text <=> root.text;
+        color: Theme.text;
+        font-size: 15px;
+        vertical-alignment: center;
+        single-line: true;
+        accepted => {
+            root.accepted();
+        }
+    }
+
+    if root.text == "": Text {
+        x: 14px;
+        width: parent.width - 28px;
+        text: root.placeholder;
+        color: Theme.text3;
+        font-size: 15px;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    public function focus-field() {
+        input.focus();
     }
 }
 
@@ -640,6 +853,9 @@ export component ListShelf inherits VerticalLayout {
             clicked => {
                 Bridge.track-clicked(root.index, i);
             }
+            menu(x, y) => {
+                Bridge.track-menu(root.index, i, x, y);
+            }
         }
     }
 }
@@ -655,8 +871,12 @@ export component TrackShelf inherits VerticalLayout {
         data: t;
         columns: root.shelf.kind != "tracks";
         numbered: root.shelf.kind == "album";
+        show-album: root.shelf.show-album;
         clicked => {
             Bridge.track-clicked(root.index, i);
+        }
+        menu(x, y) => {
+            Bridge.track-menu(root.index, i, x, y);
         }
     }
 }
