@@ -718,6 +718,9 @@ export component AppWindow inherits Window {
     in-out property <bool> account-open;
     in property <string> toast;
 
+    // a newer version is on disk
+    in property <bool> update-ready;
+
     // lyrics (Now Playing panel, tab 1)
     in-out property <int> np-tab: 0;
     in property <[string]> lyrics-lines;
@@ -1108,6 +1111,42 @@ export component AppWindow inherits Window {
                     clicked => {
                         root.account-open = false;
                         Bridge.sign-out();
+                    }
+                }
+            }
+        }
+    }
+
+    // update banner
+    if root.update-ready: Rectangle {
+        x: root.width - self.width - 24px;
+        y: Theme.topbar + 8px;
+        width: banner.preferred-width + 32px;
+        height: 52px;
+        Shape {
+            radius: 10px;
+            fill-color: #2a2a2a;
+            stroke-color: #ffffff1a;
+            stroke-w: 1px;
+        }
+
+        banner := HorizontalLayout {
+            x: 16px;
+            spacing: 14px;
+            Text {
+                text: "A new version of Yusic is ready";
+                color: Theme.text;
+                font-size: 14px;
+                vertical-alignment: center;
+            }
+
+            VerticalLayout {
+                alignment: center;
+                PillButton {
+                    text: "Restart";
+                    primary: true;
+                    clicked => {
+                        Bridge.restart-update();
                     }
                 }
             }

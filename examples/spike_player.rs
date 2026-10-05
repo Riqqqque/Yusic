@@ -42,6 +42,10 @@ fn main() -> Result<()> {
     item.ApplyDisplayProperties(&props)?;
 
     let player = MediaPlayer::new()?;
+    // Silent unless --audible: decoding is what we test.
+    if !std::env::args().any(|a| a == "--audible") {
+        player.SetIsMuted(true)?;
+    }
     let cm = player.CommandManager()?;
     cm.NextBehavior()?.SetEnablingRule(MediaCommandEnablingRule::Always)?;
     cm.PreviousBehavior()?.SetEnablingRule(MediaCommandEnablingRule::Always)?;

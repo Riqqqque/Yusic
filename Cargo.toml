@@ -1,6 +1,6 @@
 [package]
 name = "yusic"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Rique"]
 description = "Lightweight native YouTube Music client for Windows"
@@ -9,10 +9,11 @@ description = "Lightweight native YouTube Music client for Windows"
 anyhow = "1.0.104"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 raw-window-handle = "0.6"
-reqwest = { version = "0.12", default-features = false, features = ["default-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["default-tls", "native-tls-alpn", "http2", "json"] }
 rustypipe = { version = "0.11.4", features = ["userdata"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 sha1_smol = "1.0.1"
 slint = { version = "1.18", default-features = false, features = ["std", "backend-winit", "renderer-software", "compat-1-2", "raw-window-handle-06"] }
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "process", "fs", "sync", "time"] }
@@ -29,9 +30,12 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Cryptography",
+    "Win32_System_Com",
     "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
 wry = { version = "0.57", default-features = false }
@@ -50,3 +54,11 @@ strip = true
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# Day-to-day builds for scripts/deploy.ps1: much faster to link than the
+# fat-LTO release profile, with a negligible runtime difference for this app.
+[profile.deploy]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+incremental = true
