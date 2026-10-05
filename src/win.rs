@@ -3,6 +3,10 @@
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass};
+use windows::Win32::UI::Shell::{
+    QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, ICON_BIG, ICON_SMALL, IMAGE_ICON, IsIconic, LR_DEFAULTCOLOR, LoadImageW,
     MB_ICONERROR, MB_OK, MessageBoxW, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, SW_RESTORE,
@@ -39,6 +43,23 @@ pub fn apply_app_icon(window: &slint::Window) {
                 SendMessageW(h, WM_SETICON, Some(WPARAM(kind as usize)), Some(LPARAM(icon.0 as isize)));
             }
         }
+    }
+}
+
+/// Runs Yusic (and the yt-dlp/JS processes it starts) below normal priority so
+/// games and other foreground work always win the CPU. Audio playback is not
+/// affected: Windows schedules the audio render thread through MMCSS.
+pub fn lower_priority() {
+    unsafe {
+        let _ = SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+    }
+}
+
+/// True while a fullscreen app (a game, a presentation) has the screen.
+pub fn fullscreen_app_active() -> bool {
+    match unsafe { SHQueryUserNotificationState() } {
+        Ok(s) => s == QUNS_BUSY || s == QUNS_RUNNING_D3D_FULL_SCREEN || s == QUNS_PRESENTATION_MODE,
+        Err(_) => false,
     }
 }
 

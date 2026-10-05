@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const BELOW_NORMAL_PRIORITY: u32 = 0x0000_4000;
 const YTDLP_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
 const YTDLP_SUMS: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS";
 const DENO_ZIP: &str = "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip";
@@ -102,7 +103,7 @@ pub async fn install(data_dir: &Path, http: &reqwest::Client, progress: impl Fn(
                 .arg(&zip)
                 .arg("-C")
                 .arg(&dir)
-                .creation_flags(CREATE_NO_WINDOW)
+                .creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY)
                 .status()
                 .await?;
             let _ = std::fs::remove_file(&zip);
@@ -155,7 +156,7 @@ pub async fn update_ytdlp(ytdlp: &Path, data_dir: &Path) -> bool {
         Duration::from_secs(180),
         tokio::process::Command::new(ytdlp)
             .args(["-U", "--no-warnings"])
-            .creation_flags(CREATE_NO_WINDOW)
+            .creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY)
             .kill_on_drop(true)
             .output(),
     )
