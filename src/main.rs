@@ -108,6 +108,7 @@ fn run() -> Result<()> {
         install::wait_for_process(pid);
     }
     remove_old_copies();
+    win::lower_priority();
     if args.uninstall {
         install::uninstall(&data_dir());
         return Ok(());

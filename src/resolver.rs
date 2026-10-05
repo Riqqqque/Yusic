@@ -18,6 +18,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{OnceCell, Semaphore};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const BELOW_NORMAL_PRIORITY: u32 = 0x0000_4000;
 const CHUNK: u64 = 10 << 20;
 /// Best audio first: 256 kbps Opus/AAC (YouTube Music Premium, needs the
 /// signed-in session), then ~160 kbps Opus, then 128 kbps AAC.
@@ -236,7 +237,7 @@ impl Resolver {
             .arg(&tools.js_runtime)
             .args(["--no-warnings", "--no-playlist", "--no-progress", "-f", quality.format(), "--cache-dir"])
             .arg(&self.ytdlp_cache)
-        .creation_flags(CREATE_NO_WINDOW)
+        .creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY)
         .kill_on_drop(true)
         .stdin(std::process::Stdio::null());
         Ok(c)

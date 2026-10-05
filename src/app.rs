@@ -120,6 +120,8 @@ struct State {
     /// Line start times (ms) when the lyrics are synced.
     lyrics_times: Vec<u32>,
     tick_ms: u64,
+    /// A fullscreen game/app has the screen: skip redraws.
+    game_mode: bool,
     suggest_gen: u64,
     toast_gen: u64,
     visible: bool,
@@ -1258,8 +1260,15 @@ impl App {
             self.tick.stop();
             return;
         }
-        // Synced lyrics need a finer clock than the progress bar.
-        let ms = if synced && self.lyrics_visible() { 150 } else { 500 };
+        // Synced lyrics need a finer clock than the progress bar; while a
+        // fullscreen game runs nothing is drawn, so only check now and then.
+        let ms = if self.st.borrow().game_mode {
+            2000
+        } else if synced && self.lyrics_visible() {
+            150
+        } else {
+            500
+        };
         if self.tick.running() && self.st.borrow().tick_ms == ms {
             return;
         }
@@ -1272,7 +1281,13 @@ impl App {
     }
 
     fn update_position(&self) {
-        if !self.st.borrow().has_source {
+        // Don't redraw (software rendering costs CPU) behind a fullscreen game.
+        let game = crate::win::fullscreen_app_active();
+        if game != self.st.borrow().game_mode {
+            self.st.borrow_mut().game_mode = game;
+            self.update_timer();
+        }
+        if game || !self.st.borrow().has_source {
             return;
         }
         let (pos, dur) = self.player.position();
