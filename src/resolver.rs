@@ -71,6 +71,11 @@ pub struct Resolver {
     procs: Semaphore,
     inflight: Mutex<HashMap<String, Arc<OnceCell<PathBuf>>>>,
     keep: Mutex<HashSet<String>>,
+    /// A sign-in cookie yt-dlp just failed with (hash, when). Skipped for a
+    /// while so each song doesn't pay for two yt-dlp runs.
+    bad_cookie: Mutex<Option<(u64, std::time::Instant)>>,
+    /// Signalled when first-run setup has installed the tools.
+    tools_ready: tokio::sync::Notify,
 }
 
 impl Resolver {
@@ -88,6 +93,8 @@ impl Resolver {
             procs: Semaphore::new(2),
             inflight: Mutex::new(HashMap::new()),
             keep: Mutex::new(HashSet::new()),
+            bad_cookie: Mutex::new(None),
+            tools_ready: tokio::sync::Notify::new(),
         };
         // Nothing from a previous session is needed, including cookie files
         // left behind if the app was killed mid-request.
@@ -106,17 +113,61 @@ impl Resolver {
 
     pub fn set_tools(&self, tools: crate::tools::Tools) {
         *self.tools.write().unwrap() = Some(tools);
+        self.tools_ready.notify_waiters();
+    }
+
+    /// On first run, a song requested while yt-dlp is still being set up
+    /// waits for it instead of failing.
+    async fn wait_for_tools(&self) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(180);
+        while !self.has_tools() {
+            let ready = self.tools_ready.notified();
+            if self.has_tools() || tokio::time::timeout_at(deadline, ready).await.is_err() {
+                return;
+            }
+        }
     }
 
     pub fn has_tools(&self) -> bool {
         self.tools.read().unwrap().is_some()
     }
 
-    /// Updates yt-dlp while no download is using it.
+    /// Brings yt-dlp up to date (and onto the fast folder build). The download
+    /// runs alongside playback; only the final folder swap waits for running
+    /// yt-dlp calls. Returns true if it changed.
     pub async fn update_ytdlp(&self) -> bool {
-        let Some(ytdlp) = self.tools.read().unwrap().as_ref().map(|t| t.ytdlp.clone()) else { return false };
+        let Some(current) = self.tools.read().unwrap().as_ref().map(|t| t.ytdlp.clone()) else { return false };
+        let staged = match crate::tools::stage_ytdlp_update(&current, &self.data_dir, &self.http).await {
+            Ok(Some(s)) => s,
+            _ => return false,
+        };
         let Ok(_all) = self.procs.acquire_many(2).await else { return false };
-        crate::tools::update_ytdlp(&ytdlp, &self.data_dir).await
+        let dir = crate::tools::ytdlp_dir(&self.data_dir);
+        let old = dir.with_extension("old");
+        let _ = std::fs::remove_dir_all(&old);
+        if dir.exists() && std::fs::rename(&dir, &old).is_err() {
+            let _ = std::fs::remove_dir_all(&staged);
+            return false;
+        }
+        if std::fs::rename(&staged, &dir).is_err() {
+            let _ = std::fs::rename(&old, &dir);
+            return false;
+        }
+        let _ = std::fs::remove_dir_all(&old);
+        // The single-file build it replaces, if Yusic downloaded that one.
+        let single = crate::tools::tools_dir(&self.data_dir).join("yt-dlp.exe");
+        if current == single {
+            let _ = std::fs::remove_file(&single);
+        }
+        if let Some(t) = self.tools.write().unwrap().as_mut() {
+            t.ytdlp = dir.join("yt-dlp.exe");
+        }
+        true
+    }
+
+    /// The yt-dlp in use is the slow-starting single-file build.
+    pub fn needs_faster_ytdlp(&self) -> bool {
+        self.tools.read().unwrap().as_ref().is_some_and(|t| !crate::tools::is_folder_build(&t.ytdlp))
     }
 
     /// An already downloaded file for this stem, whatever its format.
@@ -209,10 +260,16 @@ impl Resolver {
         }
         // Signed in: ask with the account first, which also unlocks Premium's
         // 256 kbps formats and private/uploaded tracks; fall back to anonymous.
+        let cookie = cookie.filter(|c| !self.cookie_failing(c));
         let resolved = match &cookie {
             Some(c) => match self.resolve(id, Some(c), quality).await {
                 Ok(r) => r,
-                Err(_) => self.resolve(id, None, quality).await?,
+                Err(_) => {
+                    let r = self.resolve(id, None, quality).await?;
+                    // Works without the account: the cookie is the problem.
+                    *self.bad_cookie.lock().unwrap() = Some((cookie_hash(c), std::time::Instant::now()));
+                    r
+                }
             },
             None => self.resolve(id, None, quality).await?,
         };
@@ -223,13 +280,23 @@ impl Resolver {
         let path = self.dir.join(format!("{stem}.{ext}"));
         let path = match self.download(&resolved, &path).await {
             Ok(()) => path,
-            Err(e) => self
-                .ytdlp_download(id, stem, cookie.as_deref(), quality)
-                .await
-                .with_context(|| format!("direct download failed ({e:#})"))?,
+            Err(e) => {
+                let with_account = self.ytdlp_download(id, stem, cookie.as_deref(), quality).await;
+                match (with_account, cookie.is_some()) {
+                    (Ok(p), _) => Ok(p),
+                    (Err(_), true) => self.ytdlp_download(id, stem, None, quality).await,
+                    (Err(err), false) => Err(err),
+                }
+                .with_context(|| format!("direct download failed ({e:#})"))?
+            }
         };
         disable_fragmented_edit_list(&path)?;
         Ok(path)
+    }
+
+    fn cookie_failing(&self, cookie: &str) -> bool {
+        const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+        matches!(*self.bad_cookie.lock().unwrap(), Some((h, at)) if h == cookie_hash(cookie) && at.elapsed() < RETRY_AFTER)
     }
 
     fn command(&self, quality: Quality) -> Result<tokio::process::Command> {
@@ -262,6 +329,7 @@ impl Resolver {
     }
 
     async fn resolve(&self, id: &str, cookie: Option<&str>, quality: Quality) -> Result<Resolved> {
+        self.wait_for_tools().await;
         let _permit = self.procs.acquire().await?;
         let mut cmd = self.command(quality)?;
         let _cookies = match cookie {
@@ -380,6 +448,13 @@ impl Drop for TempFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+fn cookie_hash(cookie: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    cookie.hash(&mut h);
+    h.finish()
 }
 
 fn watch_url(id: &str) -> String {

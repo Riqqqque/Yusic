@@ -61,11 +61,26 @@ pub fn covered_by_fullscreen(window: &slint::Window) -> bool {
     use windows::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromWindow,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetForegroundWindow, GetWindowRect};
+    use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetClassNameW, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, IsWindowVisible,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    };
     let Some(me) = hwnd(window) else { return false };
     unsafe {
         let fg = GetForegroundWindow();
-        if fg.is_invalid() || fg == me {
+        if fg.is_invalid() || fg == me || !IsWindowVisible(fg).as_bool() {
+            return false;
+        }
+        // Overlays (game bar, Discord, recorders) span the screen but are
+        // see-through; they don't hide Yusic.
+        let ex = GetWindowLongPtrW(fg, GWL_EXSTYLE) as u32;
+        if ex & (WS_EX_TRANSPARENT.0 | WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0) != 0 {
+            return false;
+        }
+        let mut cloaked = 0u32;
+        let _ = DwmGetWindowAttribute(fg, DWMWA_CLOAKED, &mut cloaked as *mut u32 as *mut _, 4);
+        if cloaked != 0 {
             return false;
         }
         // The desktop spans the monitor too, but it's behind everything.

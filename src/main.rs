@@ -155,7 +155,8 @@ fn run() -> Result<()> {
         .build()?;
     let http = reqwest::Client::builder()
         .user_agent(concat!("Yusic/", env!("CARGO_PKG_VERSION")))
-        .pool_idle_timeout(Duration::from_secs(30))
+        // Keeps the audio host's connection between songs (saves a TLS handshake).
+        .pool_idle_timeout(Duration::from_secs(120))
         .connect_timeout(Duration::from_secs(10))
         .read_timeout(Duration::from_secs(30))
         .build()?;
@@ -428,10 +429,12 @@ fn start_background_jobs(rt: &tokio::runtime::Runtime, res: &Arc<Resolver>, dir:
     rt.spawn(async move {
         tokio::time::sleep(Duration::from_secs(90)).await;
         let stamp = tools::tools_dir(&dir2).join("yt-dlp.checked");
-        let due = std::fs::metadata(&stamp)
-            .and_then(|m| m.modified())
-            .map(|t| t.elapsed().unwrap_or_default() > Duration::from_secs(24 * 3600))
-            .unwrap_or(true);
+        // Daily, or right away to move off the slow single-file build.
+        let due = res2.needs_faster_ytdlp()
+            || std::fs::metadata(&stamp)
+                .and_then(|m| m.modified())
+                .map(|t| t.elapsed().unwrap_or_default() > Duration::from_secs(24 * 3600))
+                .unwrap_or(true);
         if due {
             res2.update_ytdlp().await;
             let _ = std::fs::create_dir_all(tools::tools_dir(&dir2));

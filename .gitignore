@@ -1,4 +1,5 @@
 /target
 /tools/*.exe
+/tools/yt-dlp/
 /dist
 /.claude/

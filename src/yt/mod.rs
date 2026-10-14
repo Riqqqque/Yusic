@@ -32,6 +32,7 @@ pub struct Yt {
     rp: RustyPipe,
     http: reqwest::Client,
     cache: ProtectedStorage,
+    client_version: RwLock<Option<(std::time::Instant, String)>>,
     cookies: CookieStore,
     cookie: RwLock<Option<String>>,
     /// Content region (ISO country code), e.g. "US".
@@ -95,6 +96,7 @@ impl Yt {
             rp,
             http,
             cache: ProtectedStorage(cache_path),
+            client_version: RwLock::new(None),
             cookies,
             cookie,
             region: RwLock::new("US".into()),
@@ -109,6 +111,12 @@ impl Yt {
             Ok(c) => q.country(c),
             Err(_) => q,
         }
+    }
+
+    /// Queries that YouTube personalizes (radio, autoplay) go out signed in,
+    /// so they follow the user's taste and skip disliked songs.
+    fn qa(&self) -> RustyPipeQuery {
+        if self.signed_in() { self.q().authenticated() } else { self.q() }
     }
 
     pub fn set_region(&self, code: &str) {
@@ -159,8 +167,22 @@ impl Yt {
         }
     }
 
-    /// rustypipe keeps the current YTM web client version in its cache.
+    /// rustypipe keeps the current YTM web client version in its cache. Reading
+    /// it means a disk read, a DPAPI decrypt and a JSON parse, so the answer
+    /// is kept for a while.
     fn client_version(&self) -> String {
+        const KEEP: std::time::Duration = std::time::Duration::from_secs(600);
+        if let Some((at, v)) = self.client_version.read().unwrap().as_ref() {
+            if at.elapsed() < KEEP {
+                return v.clone();
+            }
+        }
+        let v = self.read_client_version();
+        *self.client_version.write().unwrap() = Some((std::time::Instant::now(), v.clone()));
+        v
+    }
+
+    fn read_client_version(&self) -> String {
         self.cache
             .read()
             .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -306,7 +328,8 @@ impl Yt {
                 thumb: best_thumb(&a.cover),
                 round: false,
             },
-            radio: tracks.first().map(|t| format!("RDAMVM{}", t.id)),
+            // The album's own mix, like YouTube Music's autoplay after an album.
+            radio: a.playlist_id.as_ref().map(|p| format!("RDAMPL{p}")).or_else(|| tracks.first().map(|t| format!("RDAMVM{}", t.id))),
             play: tracks,
             shelves,
             actions,
@@ -346,7 +369,7 @@ impl Yt {
                 thumb: p.thumb,
                 round: false,
             },
-            radio: p.items.first().map(|t| format!("RDAMVM{}", t.id)),
+            radio: playlist_mix(id, p.items.first()),
             play: p.items.clone(),
             shelves: vec![Shelf { title: String::new(), kind: ShelfKind::TrackList, items: p.items }],
             continuation: p.continuation.map(Continuation::PlaylistRows),
@@ -398,7 +421,7 @@ impl Yt {
                 thumb: best_thumb(&p.thumbnail),
                 round: false,
             },
-            radio: tracks.first().map(|t| format!("RDAMVM{}", t.id)),
+            radio: playlist_mix(id, tracks.first()),
             play: tracks,
             shelves,
             continuation,
@@ -407,7 +430,7 @@ impl Yt {
     }
 
     pub async fn more_tracks(&self, pag: &Paginator<TrackItem>) -> Result<(Vec<Item>, Option<Paginator<TrackItem>>)> {
-        let Some(next) = pag.next(self.q()).await? else {
+        let Some(next) = pag.next(self.qa()).await? else {
             return Ok((Vec::new(), None));
         };
         let items = next.items.iter().map(track_item).collect();
@@ -770,29 +793,90 @@ impl Yt {
     /// Up-next radio for a track (what YTM plays after a single song), plus
     /// a paginator for more.
     pub async fn radio(&self, video_id: &str) -> Result<(Vec<Item>, Option<Paginator<TrackItem>>)> {
-        let r = self.q().music_radio_track(video_id).await?;
+        let r = self.qa().music_radio_track(video_id).await?;
         Ok(radio_parts(r))
     }
 
     pub async fn radio_playlist(&self, radio_id: &str) -> Result<(Vec<Item>, Option<Paginator<TrackItem>>)> {
-        let r = self.q().music_radio(radio_id).await?;
+        let r = self.qa().music_radio(radio_id).await?;
         Ok(radio_parts(r))
     }
 
     /// Tracks to play when a card's play button is pressed.
-    pub async fn playable(&self, kind: Kind, id: &str) -> Result<Vec<Item>> {
+    pub async fn playable(&self, kind: Kind, id: &str) -> Result<Playable> {
+        let from_page = |p: Page| Playable { items: p.play, seed: p.radio, more: track_continuation(p.continuation) };
         Ok(match kind {
-            Kind::Album => self.album(id).await?.play,
-            Kind::Playlist | Kind::Podcast => self.playlist(id).await?.play,
+            Kind::Album => from_page(self.album(id).await?),
+            Kind::Playlist | Kind::Podcast => from_page(self.playlist(id).await?),
             Kind::Artist => {
                 let page = self.artist(id).await?;
-                match page.radio {
-                    Some(r) => self.radio_playlist(&r).await.map(|r| r.0).unwrap_or(page.play),
+                let items = match &page.radio {
+                    Some(r) => self.radio_playlist(r).await.map(|r| r.0).unwrap_or(page.play),
                     None => page.play,
-                }
+                };
+                Playable { items, seed: None, more: None }
             }
-            _ => Vec::new(),
+            _ => Playable::default(),
         })
+    }
+
+    /// Everything after `cont` in a playlist, so playing a long playlist
+    /// doesn't stop (and fall into autoplay) after the first loaded rows.
+    /// `known` are the rows already loaded. Stops early on errors, with what
+    /// it has, and when a page brings nothing new: some playlists offer an
+    /// endless "next page" that repeats the same rows.
+    pub async fn rest_of(&self, cont: Continuation, known: &[Item]) -> Vec<Item> {
+        const MAX_PAGES: usize = 80;
+        let mut seen: std::collections::HashSet<String> = known.iter().map(row_key).collect();
+        let mut out = Vec::new();
+        let mut next = Some(cont);
+        for _ in 0..MAX_PAGES {
+            let page = match next.take() {
+                Some(Continuation::PlaylistRows(t)) => {
+                    self.playlist_more(&t).await.map(|(i, n)| (i, n.map(Continuation::PlaylistRows)))
+                }
+                Some(Continuation::Tracks(p)) => self.more_tracks(&p).await.map(|(i, n)| (i, n.map(Continuation::Tracks))),
+                _ => break,
+            };
+            let Ok((items, more)) = page else { break };
+            let fresh: Vec<Item> = items.into_iter().filter(|i| seen.insert(row_key(i))).collect();
+            if fresh.is_empty() {
+                break;
+            }
+            out.extend(fresh);
+            next = more;
+        }
+        out
+    }
+}
+
+/// What a card's play button starts: the tracks, the mix to continue with
+/// when they run out, and where the rest of a long playlist comes from.
+#[derive(Default)]
+pub struct Playable {
+    pub items: Vec<Item>,
+    pub seed: Option<String>,
+    pub more: Option<Continuation>,
+}
+
+/// Identifies a playlist row: its entry id when known (a song can appear
+/// twice in a playlist), else the video id.
+pub fn row_key(i: &Item) -> String {
+    i.set_video_id.clone().unwrap_or_else(|| i.id.clone())
+}
+
+/// Only track-list continuations can extend a queue.
+pub fn track_continuation(c: Option<Continuation>) -> Option<Continuation> {
+    c.filter(|c| matches!(c, Continuation::PlaylistRows(_) | Continuation::Tracks(_)))
+}
+
+/// The mix YouTube Music plays after a playlist: built from the whole
+/// playlist. Liked music and existing mixes fall back to the first song's radio.
+fn playlist_mix(id: &str, first: Option<&Item>) -> Option<String> {
+    if id == "LM" || (id.starts_with("RD") && !id.starts_with("RDCLAK")) {
+        first.map(|t| format!("RDAMVM{}", t.id))
+    } else {
+        Some(format!("RDAMPL{id}"))
     }
 }
 
@@ -926,5 +1010,44 @@ fn playlist_item(p: &MusicPlaylistItem) -> Item {
         subtitle: sub.join(" • "),
         thumb: best_thumb(&p.thumbnail),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+
+    /// Playing a long playlist queues all of it, not just the first page:
+    /// `cargo test -- --ignored long_playlist`.
+    #[tokio::test]
+    #[ignore]
+    async fn long_playlist_loads_completely() {
+        let dir = std::env::temp_dir().join(format!("yusic-test-{}", std::process::id()));
+        let yt = Yt::new(&dir, reqwest::Client::new()).unwrap();
+        // Needs playlists longer than one page (100 rows): YUSIC_LONG_PLAYLIST,
+        // or a few large public ones.
+        let ids: Vec<String> = match std::env::var("YUSIC_LONG_PLAYLIST") {
+            Ok(id) => vec![id],
+            Err(_) => ["PLMC9KNkIncKtPzgY-5rmhvj7fax8fdxoj", "PL4fGSI1pDJn6O1LS0XSdF3RyO0Rq_LDeI", "PLw-VjHDlEOgvtnnnqWlTqByAtC7tXBg6D"]
+                .map(String::from)
+                .to_vec(),
+        };
+        let mut best = 0;
+        for id in &ids {
+            let Ok(page) = yt.playlist(id).await else { continue };
+            let pl = (id, page.play.len());
+            let Some(more) = track_continuation(page.continuation.clone()) else { continue };
+            let rest = yt.rest_of(more, &page.play).await;
+            println!("{}: first page {}, rest {}, mix {:?}", pl.0, pl.1, rest.len(), page.radio);
+            assert!(page.radio.as_deref().is_some_and(|r| r.starts_with("RDAMPL")));
+            best = best.max(rest.len());
+            if rest.len() >= 99 {
+                let (mix, _) = yt.radio_playlist(page.radio.as_deref().unwrap()).await.unwrap();
+                assert!(!mix.is_empty());
+                break;
+            }
+        }
+        assert!(best >= 99, "no long playlist loaded past its first page");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -113,8 +113,10 @@ struct State {
     pending_advance: bool,
     /// Track we already fetched end-of-queue autoplay for.
     autoplay_for: Option<String>,
+    /// Mix to continue with when the queue (an album or playlist) runs out.
+    autoplay_seed: Option<String>,
     /// Queue thumbnails were requested for the current queue rows.
-    queue_images: bool,
+    queue_images: Option<std::ops::Range<usize>>,
     /// Bumped only when the whole queue is replaced; radio results for an
     /// older queue are dropped (jumping within the queue keeps them).
     queue_gen: u64,
@@ -712,7 +714,11 @@ impl App {
             st.page.continuation = None;
             return;
         };
-        st.page.continuation = next;
+        let Some(shelf) = st.page.shelves.first() else { return };
+        // Some playlists offer an endless "next page" repeating the same rows.
+        let have: HashSet<String> = shelf.items.iter().map(crate::yt::row_key).collect();
+        let items: Vec<Item> = items.into_iter().filter(|i| !have.contains(&crate::yt::row_key(i))).collect();
+        st.page.continuation = if items.is_empty() { None } else { next };
         let Some(shelf) = st.page.shelves.first() else { return };
         let base = shelf.items.len();
         if let Some(m) = st.shelf_models.first() {
@@ -787,9 +793,12 @@ impl App {
         let req = self.st.borrow().play_req;
         self.spawn(
             async move { yt.playable(kind, &id).await.map_err(|e| format!("{e:#}")) },
-            move |app, items| match items {
+            move |app, p| match p {
                 _ if app.st.borrow().play_req != req => {}
-                Ok(items) if !items.is_empty() => app.play_items(items, 0, false),
+                Ok(p) if !p.items.is_empty() => {
+                    app.play_items(p.items, 0, false);
+                    app.queue_extras(p.seed, p.more);
+                }
                 Ok(_) => app.toast("Nothing to play here"),
                 Err(e) => app.toast(format!("Couldn't load: {e}")),
             },
@@ -821,14 +830,24 @@ impl App {
         if shelf_kind.is_collection() {
             let playable: Vec<Item> = items.iter().filter(|i| i.kind.playable()).cloned().collect();
             let start = playable.iter().position(|i| i.id == item.id).unwrap_or(0);
+            let (seed, more) = {
+                let st = self.st.borrow();
+                // The page's continuation belongs to its (first) track list.
+                let more = if si == 0 { crate::yt::track_continuation(st.page.continuation.clone()) } else { None };
+                (st.page.radio.clone(), more)
+            };
             self.play_items(playable, start, false);
+            self.queue_extras(seed, more);
         } else {
             self.play_items(vec![item], 0, true);
         }
     }
 
     fn play_header(self: &Rc<Self>, shuffle: bool) {
-        let items = self.st.borrow().page.play.clone();
+        let (items, seed, more) = {
+            let st = self.st.borrow();
+            (st.page.play.clone(), st.page.radio.clone(), crate::yt::track_continuation(st.page.continuation.clone()))
+        };
         if items.is_empty() {
             return;
         }
@@ -840,6 +859,7 @@ impl App {
         } else {
             self.play_items(items, 0, false);
         }
+        self.queue_extras(seed, more);
     }
 
     fn radio_header(self: &Rc<Self>) {
@@ -902,6 +922,7 @@ impl App {
             st.radio_busy = radio;
             st.pending_advance = false;
             st.autoplay_for = None;
+            st.autoplay_seed = None;
             st.fail_streak = 0;
             (st.shuffle, st.queue_gen)
         };
@@ -949,22 +970,26 @@ impl App {
 
     /// Appends more radio tracks (or end-of-queue autoplay) when the queue runs low.
     fn extend_queue(self: &Rc<Self>) {
-        let (pag, autoplay) = {
+        let (pag, autoplay, seed) = {
             let mut st = self.st.borrow_mut();
             if st.radio_busy || st.repeat != 0 || st.queue.is_empty() || st.qi + 3 < st.queue.len() {
                 return;
             }
             match st.radio_more.take() {
-                Some(p) => (Some(p), None),
+                Some(p) => (Some(p), None, None),
                 None if !self.settings.borrow().autoplay => return,
-                None => {
-                    let last = st.queue.last().map(|i| i.id.clone()).unwrap_or_default();
-                    if st.autoplay_for.as_deref() == Some(last.as_str()) {
-                        return;
+                // An album or playlist continues with its own mix.
+                None => match st.autoplay_seed.take() {
+                    Some(seed) => (None, None, Some(seed)),
+                    None => {
+                        let last = st.queue.last().map(|i| i.id.clone()).unwrap_or_default();
+                        if st.autoplay_for.as_deref() == Some(last.as_str()) {
+                            return;
+                        }
+                        st.autoplay_for = Some(last.clone());
+                        (None, Some(last), None)
                     }
-                    st.autoplay_for = Some(last.clone());
-                    (None, Some(last))
-                }
+                },
             }
         };
         let req = {
@@ -974,12 +999,14 @@ impl App {
         };
         // Kept so a failed fetch can be retried later.
         let retry = pag.clone();
+        let retry_seed = seed.clone();
         let yt = self.yt.clone();
         self.spawn(
             async move {
-                match (pag, autoplay) {
-                    (Some(p), _) => yt.more_tracks(&p).await.ok(),
-                    (None, Some(id)) => yt.radio(&id).await.ok(),
+                match (pag, seed, autoplay) {
+                    (Some(p), _, _) => yt.more_tracks(&p).await.ok(),
+                    (None, Some(s), _) => yt.radio_playlist(&s).await.ok(),
+                    (None, None, Some(id)) => yt.radio(&id).await.ok(),
                     _ => None,
                 }
             },
@@ -993,6 +1020,8 @@ impl App {
                     let Some((items, more)) = r else {
                         if retry.is_some() {
                             st.radio_more = retry;
+                        } else if retry_seed.is_some() {
+                            st.autoplay_seed = retry_seed;
                         } else {
                             st.autoplay_for = None;
                         }
@@ -1009,6 +1038,44 @@ impl App {
                 app.prefetch_next();
             },
         );
+    }
+
+    /// After play_items for an album or playlist: remembers its mix for
+    /// autoplay and queues the rows that weren't loaded yet, so long
+    /// playlists play to the end before autoplay starts.
+    pub(crate) fn queue_extras(self: &Rc<Self>, seed: Option<String>, more: Option<Continuation>) {
+        let qgen = {
+            let mut st = self.st.borrow_mut();
+            st.autoplay_seed = seed;
+            if more.is_some() {
+                // Holds autoplay back until the rest is in.
+                st.radio_busy = true;
+            }
+            st.queue_gen
+        };
+        let Some(more) = more else { return };
+        let known = self.st.borrow().queue.clone();
+        let yt = self.yt.clone();
+        self.spawn(async move { yt.rest_of(more, &known).await }, move |app, items| {
+            let (shuffle, qi, added) = {
+                let mut st = app.st.borrow_mut();
+                if st.queue_gen != qgen {
+                    return;
+                }
+                st.radio_busy = false;
+                let have: HashSet<String> = st.queue.iter().map(|i| i.id.clone()).collect();
+                let before = st.queue.len();
+                st.queue.extend(items.into_iter().filter(|i| i.kind.playable() && !i.id.is_empty() && !have.contains(&i.id)));
+                (st.shuffle, st.qi, st.queue.len() > before)
+            };
+            if added && shuffle {
+                // Keep the already prepared next song; mix the new rows into the rest.
+                app.shuffle_after(qi + 1);
+            }
+            app.refresh_queue();
+            app.resume_if_waiting();
+            app.prefetch_next();
+        });
     }
 
     /// More songs couldn't be fetched. If playback was waiting on them, say so
@@ -1042,20 +1109,31 @@ impl App {
             })
             .collect();
         self.queue_model.set_vec(rows);
-        self.st.borrow_mut().queue_images = false;
+        self.st.borrow_mut().queue_images = None;
         self.load_queue_images();
     }
 
     /// Queue thumbnails are fetched only while the Now Playing panel is open.
     fn load_queue_images(&self) {
         let ui = self.ui();
-        if !ui.get_np_open() || !self.st.borrow().visible || self.st.borrow().queue_images {
+        if !ui.get_np_open() || !self.st.borrow().visible {
             return;
         }
-        self.st.borrow_mut().queue_images = true;
-        let thumbs: Vec<(String, String)> = self.st.borrow().queue.iter().map(|i| (i.id.clone(), i.thumb.clone())).collect();
-        for (i, (id, thumb)) in thumbs.iter().enumerate() {
-            load_track_image(&self.queue_model, i, id, thumb);
+        // Around the current song, so a long queue doesn't fetch hundreds of
+        // thumbnails; moves along as playback does.
+        let thumbs: Vec<(usize, String, String)> = {
+            let mut st = self.st.borrow_mut();
+            let qi = st.qi;
+            let want_end = (qi + 60).min(st.queue.len());
+            if st.queue_images.as_ref().is_some_and(|r| r.start <= qi && want_end <= r.end) {
+                return;
+            }
+            let range = qi.saturating_sub(10)..(qi + 150).min(st.queue.len());
+            st.queue_images = Some(range.clone());
+            st.queue.iter().enumerate().skip(range.start).take(range.len()).map(|(i, it)| (i, it.id.clone(), it.thumb.clone())).collect()
+        };
+        for (i, id, thumb) in &thumbs {
+            load_track_image(&self.queue_model, *i, id, thumb);
         }
     }
 
@@ -1116,6 +1194,7 @@ impl App {
         ui.set_time_text("".into());
         self.reload_now_images();
         self.mark_active(&item.id);
+        self.load_queue_images();
 
         if item.title == item.id && item.artists.is_empty() {
             self.fill_metadata(&item.id);
@@ -1757,11 +1836,15 @@ impl App {
 
     // ---------------------------------------------------------------- window
 
-    pub fn set_visible(&self, visible: bool) {
+    pub fn set_visible(self: &Rc<Self>, visible: bool) {
         self.st.borrow_mut().visible = visible;
         if !visible {
             images::trim();
         } else {
+            // The song may have changed while hidden; its lyrics load now.
+            if self.lyrics_visible() {
+                self.ensure_lyrics();
+            }
             self.update_position();
             self.load_queue_images();
         }
@@ -1824,7 +1907,7 @@ impl App {
         }
     }
 
-    pub fn hide_window(&self) {
+    pub fn hide_window(self: &Rc<Self>) {
         let _ = self.ui().hide();
         self.set_visible(false);
     }

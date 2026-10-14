@@ -465,27 +465,40 @@ impl App {
                     let yt = self.yt.clone();
                     let action = action.to_owned();
                     let req = self.st.borrow().play_req;
-                    self.spawn(async move { yt.playable(kind, &id).await.map_err(|e| format!("{e:#}")) }, move |app, r| {
-                        match r {
-                            Ok(items) if !items.is_empty() => match action.as_str() {
+                    let whole = matches!(action.as_str(), "play-next" | "add-queue");
+                    self.spawn(
+                        async move {
+                            let mut p = yt.playable(kind, &id).await.map_err(|e| format!("{e:#}"))?;
+                            // Queueing a playlist adds all of it.
+                            if whole {
+                                if let Some(more) = p.more.take() {
+                                    let rest = yt.rest_of(more, &p.items).await;
+                                    p.items.extend(rest);
+                                }
+                            }
+                            Ok::<_, String>(p)
+                        },
+                        move |app, r| match r {
+                            Ok(p) if !p.items.is_empty() => match action.as_str() {
                                 "play" | "shuffle" if app.st.borrow().play_req == req => {
                                     let start = if action == "shuffle" {
                                         app.st.borrow_mut().shuffle = true;
                                         app.ui().set_shuffle(true);
-                                        (app.rand() as usize) % items.len()
+                                        (app.rand() as usize) % p.items.len()
                                     } else {
                                         0
                                     };
-                                    app.play_items(items, start, false);
+                                    app.play_items(p.items, start, false);
+                                    app.queue_extras(p.seed, p.more);
                                 }
-                                "play-next" => app.enqueue(items, true),
-                                "add-queue" => app.enqueue(items, false),
+                                "play-next" => app.enqueue(p.items, true),
+                                "add-queue" => app.enqueue(p.items, false),
                                 _ => {}
                             },
                             Ok(_) => app.toast(format!("Nothing to play in \"{title}\".")),
                             Err(e) => app.toast(format!("Couldn't load \"{title}\": {e}")),
-                        }
-                    });
+                        },
+                    );
                 }
                 _ => {}
             },

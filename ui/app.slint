@@ -1,4 +1,4 @@
-import { ScrollView, Spinner, ComboBox } from "std-widgets.slint";
+import { ScrollView, ListView, Spinner, ComboBox } from "std-widgets.slint";
 import { Theme, Icons } from "theme.slint";
 import {
     CardData, TrackData, ShelfData, HeaderData, NowData, MenuEntry, SettingsData, Bridge, Toggle, Segmented, Field,
@@ -700,9 +700,21 @@ component LyricsView inherits Rectangle {
                     property <bool> is-active-line: parent.is-active;
                 }
 
+                // Follow the current line, also when the view is (re)created
+                // with a line already active or the text rewraps.
+                init => {
+                    if self.is-active {
+                        root.follow(self.y);
+                    }
+                }
                 changed is-active => {
                     if self.is-active {
-                        root.target = self.y;
+                        root.follow(self.y);
+                    }
+                }
+                changed y => {
+                    if self.is-active {
+                        root.follow(self.y);
                     }
                 }
                 if root.synced: TouchArea {
@@ -720,9 +732,16 @@ component LyricsView inherits Rectangle {
         }
     }
 
-    // Keep the current line a third of the way down the panel.
-    changed target => {
-        fl.content-y = -max(0px, min(root.target - fl.height * 0.33, col.preferred-height - fl.height));
+    // Keep the current line a third of the way down the panel. Always
+    // scrolls, even to the same line, so a manual scroll snaps back.
+    function follow(y: length) {
+        root.target = y;
+        fl.content-y = -max(0px, min(y - fl.height * 0.33, col.preferred-height - fl.height));
+    }
+    changed height => {
+        if root.synced && root.active >= 0 {
+            root.follow(root.target);
+        }
     }
 }
 
@@ -791,17 +810,15 @@ component NowPlayingView inherits Rectangle {
                 height: 8px;
             }
 
-            if root.tab == 0: ScrollView {
-                VerticalLayout {
-                    alignment: start;
-                    for t[i] in root.queue: TrackRow {
-                        data: t;
-                        clicked => {
-                            Bridge.queue-clicked(i);
-                        }
-                        menu(x, y) => {
-                            Bridge.queue-menu(i, x, y);
-                        }
+            // Only the rows in view exist, however long the queue is.
+            if root.tab == 0: ListView {
+                for t[i] in root.queue: TrackRow {
+                    data: t;
+                    clicked => {
+                        Bridge.queue-clicked(i);
+                    }
+                    menu(x, y) => {
+                        Bridge.queue-menu(i, x, y);
                     }
                 }
             }
