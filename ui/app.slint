@@ -820,6 +820,9 @@ component NowPlayingView inherits Rectangle {
                     menu(x, y) => {
                         Bridge.queue-menu(i, x, y);
                     }
+                    hover-start => {
+                        Bridge.queue-hover(i);
+                    }
                 }
             }
             if root.tab == 1 && root.lyrics-state == "ready": LyricsView {

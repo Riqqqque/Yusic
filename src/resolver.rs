@@ -51,7 +51,7 @@ impl Quality {
 }
 const YTDLP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Resolved {
     url: String,
     filesize: Option<u64>,
@@ -76,7 +76,15 @@ pub struct Resolver {
     bad_cookie: Mutex<Option<(u64, std::time::Instant)>>,
     /// Signalled when first-run setup has installed the tools.
     tools_ready: tokio::sync::Notify,
+    /// Stream URLs looked up ahead of a click (hovered songs, a page's first
+    /// song), by stem. Finding the URL is most of the wait before a song
+    /// starts; the download itself takes a fraction of a second.
+    urls: Mutex<HashMap<String, (Arc<OnceCell<Resolved>>, std::time::Instant)>>,
 }
+
+/// googlevideo URLs last about 6 hours; stay well inside that.
+const URL_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+const MAX_URLS: usize = 48;
 
 impl Resolver {
     pub fn new(tools: Option<crate::tools::Tools>, data_dir: &Path, http: reqwest::Client) -> Result<Self> {
@@ -95,6 +103,7 @@ impl Resolver {
             keep: Mutex::new(HashSet::new()),
             bad_cookie: Mutex::new(None),
             tools_ready: tokio::sync::Notify::new(),
+            urls: Mutex::new(HashMap::new()),
         };
         // Nothing from a previous session is needed, including cookie files
         // left behind if the app was killed mid-request.
@@ -258,28 +267,21 @@ impl Resolver {
             let _ = disable_fragmented_edit_list(&path);
             return Ok(path);
         }
-        // Signed in: ask with the account first, which also unlocks Premium's
-        // 256 kbps formats and private/uploaded tracks; fall back to anonymous.
         let cookie = cookie.filter(|c| !self.cookie_failing(c));
-        let resolved = match &cookie {
-            Some(c) => match self.resolve(id, Some(c), quality).await {
-                Ok(r) => r,
-                Err(_) => {
-                    let r = self.resolve(id, None, quality).await?;
-                    // Works without the account: the cookie is the problem.
-                    *self.bad_cookie.lock().unwrap() = Some((cookie_hash(c), std::time::Instant::now()));
-                    r
-                }
-            },
-            None => self.resolve(id, None, quality).await?,
-        };
-        let ext = match resolved.ext.as_str() {
-            "webm" | "m4a" | "opus" | "mp4" => resolved.ext.clone(),
-            _ => "m4a".to_owned(),
-        };
-        let path = self.dir.join(format!("{stem}.{ext}"));
-        let path = match self.download(&resolved, &path).await {
-            Ok(()) => path,
+        // A URL looked up ahead of time (or still being looked up) is used
+        // once; otherwise look it up now.
+        let cell = self.url_cell(stem);
+        let early = cell.initialized();
+        let resolved = cell.get_or_try_init(|| self.resolve_any(id, cookie.as_deref(), quality)).await?.clone();
+        self.urls.lock().unwrap().remove(stem);
+        let mut result = self.download_resolved(&resolved, stem).await;
+        if result.is_err() && early {
+            // The early URL may have gone stale; try a fresh one.
+            let fresh = self.resolve_any(id, cookie.as_deref(), quality).await?;
+            result = self.download_resolved(&fresh, stem).await;
+        }
+        let path = match result {
+            Ok(p) => p,
             Err(e) => {
                 let with_account = self.ytdlp_download(id, stem, cookie.as_deref(), quality).await;
                 match (with_account, cookie.is_some()) {
@@ -292,6 +294,56 @@ impl Resolver {
         };
         disable_fragmented_edit_list(&path)?;
         Ok(path)
+    }
+
+    async fn download_resolved(&self, resolved: &Resolved, stem: &str) -> Result<PathBuf> {
+        let ext = match resolved.ext.as_str() {
+            "webm" | "m4a" | "opus" | "mp4" => resolved.ext.clone(),
+            _ => "m4a".to_owned(),
+        };
+        let path = self.dir.join(format!("{stem}.{ext}"));
+        self.download(resolved, &path).await.map(|()| path)
+    }
+
+    /// Signed in: ask with the account first, which also unlocks Premium's
+    /// 256 kbps formats and private/uploaded tracks; fall back to anonymous.
+    async fn resolve_any(&self, id: &str, cookie: Option<&str>, quality: Quality) -> Result<Resolved> {
+        match cookie {
+            Some(c) => match self.resolve(id, Some(c), quality).await {
+                Ok(r) => Ok(r),
+                Err(_) => {
+                    let r = self.resolve(id, None, quality).await?;
+                    // Works without the account: the cookie is the problem.
+                    *self.bad_cookie.lock().unwrap() = Some((cookie_hash(c), std::time::Instant::now()));
+                    Ok(r)
+                }
+            },
+            None => self.resolve(id, None, quality).await,
+        }
+    }
+
+    /// The shared lookup slot for a stem's stream URL.
+    fn url_cell(&self, stem: &str) -> Arc<OnceCell<Resolved>> {
+        let mut urls = self.urls.lock().unwrap();
+        urls.retain(|_, (_, at)| at.elapsed() < URL_TTL);
+        if !urls.contains_key(stem) && urls.len() >= MAX_URLS {
+            if let Some(oldest) = urls.iter().min_by_key(|(_, (_, at))| *at).map(|(k, _)| k.clone()) {
+                urls.remove(&oldest);
+            }
+        }
+        urls.entry(stem.to_owned()).or_insert_with(|| (Arc::new(OnceCell::new()), std::time::Instant::now())).0.clone()
+    }
+
+    /// Looks a song's stream URL up ahead of time (no download), so playing it
+    /// starts sooner. Cancelling the future cancels the lookup.
+    pub async fn warm(&self, id: &str, cookie: Option<String>, quality: Quality) {
+        let stem = quality.stem(id);
+        if self.existing(&stem).is_some() || self.inflight.lock().unwrap().contains_key(&stem) {
+            return;
+        }
+        let cookie = cookie.filter(|c| !self.cookie_failing(c));
+        let cell = self.url_cell(&stem);
+        let _ = cell.get_or_try_init(|| self.resolve_any(id, cookie.as_deref(), quality)).await;
     }
 
     fn cookie_failing(&self, cookie: &str) -> bool {
@@ -560,5 +612,36 @@ mod tests {
         let plain_moov = bx(b"moov", &[bx(b"mvhd", &[0; 4]), trak].concat());
         let plain = [bx(b"ftyp", b"isom\0\0\0\0"), plain_moov].concat();
         assert_eq!(find_fragmented_edts(&plain), None);
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+
+    /// Time to a playable file, cold vs after an early lookup:
+    /// `cargo test -- --ignored early_lookup --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn early_lookup_makes_start_faster() {
+        let dir = std::env::temp_dir().join(format!("yusic-res-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tools = crate::tools::find(&dir).expect("yt-dlp in tools/yt-dlp and node on PATH");
+        let res = Resolver::new(Some(tools), &dir, reqwest::Client::new()).unwrap();
+        res.retain(&["fa5IWHDbftI", "5yrYHJtOTOc"]);
+
+        let t = std::time::Instant::now();
+        res.ensure("fa5IWHDbftI", None, Quality::Best).await.unwrap();
+        let cold = t.elapsed();
+
+        res.warm("5yrYHJtOTOc", None, Quality::Best).await;
+        let t = std::time::Instant::now();
+        res.ensure("5yrYHJtOTOc", None, Quality::Best).await.unwrap();
+        let warm = t.elapsed();
+
+        println!("cold {cold:?}, after early lookup {warm:?}");
+        assert!(warm < cold);
+        res.retain(&[]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

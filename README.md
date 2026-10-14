@@ -60,6 +60,7 @@ Test runs (`--snapshot`, `--exit-after`) refuse to start next to a running Yusic
 
 - YouTube's DASH audio is fragmented MP4. When a file carries an edit list, Media Foundation jumps to the end of the track, so the resolver neutralizes the `edts` box after download (see `disable_fragmented_edit_list`).
 - rustypipe's combined search mis-parses song rows, so songs and videos come from the filtered searches.
+- Speed: finding a song's stream (yt-dlp) is most of the wait before it plays, so Yusic does it early: for the next song in the queue, a song you rest the pointer on, and the first song of an album or playlist you open. yt-dlp runs as its unpacked build, which starts about 2 s faster than the single exe.
 - Audio: the best format available is chosen, in this order: 256 kbps Opus/AAC (YouTube Music Premium, when signed in), ~160 kbps Opus, then 128 kbps AAC. If Windows can't decode a file, that track is fetched again as AAC.
 - Lyrics: time-synced lyrics come from [LRCLIB](https://lrclib.net), with YouTube Music's own lyrics as a fallback. Covers and re-uploads get the original song's words without the timing.
 - When signed in: like or dislike songs (player bar), create, edit and delete playlists, save songs to playlists, remove songs from your own playlists, save albums and playlists to your library, and subscribe to artists. Right-click a song or card, or use its ⋮ button, for Play next, Add to queue, Start radio, Go to artist or album, and Copy link.

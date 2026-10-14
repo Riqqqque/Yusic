@@ -95,6 +95,9 @@ export global Bridge {
     callback card-play(CardData);
     callback track-clicked(int, int);
     callback queue-clicked(int);
+    // The pointer rests on a song: its stream can be looked up early.
+    callback track-hover(int, int);
+    callback queue-hover(int);
     callback artist-clicked(string);
     callback album-clicked(string);
     callback search(string);
@@ -487,7 +490,13 @@ export component TrackRow inherits Rectangle {
     callback clicked;
     // Context menu at (x, y) in window coordinates.
     callback menu(length, length);
+    callback hover-start;
     property <bool> hovered: ta.has-hover || mta.has-hover;
+    changed hovered => {
+        if self.hovered {
+            root.hover-start();
+        }
+    }
     height: 56px;
     border-radius: 4px;
     background: root.hovered ? Theme.hover : transparent;
@@ -856,6 +865,9 @@ export component ListShelf inherits VerticalLayout {
             menu(x, y) => {
                 Bridge.track-menu(root.index, i, x, y);
             }
+            hover-start => {
+                Bridge.track-hover(root.index, i);
+            }
         }
     }
 }
@@ -877,6 +889,9 @@ export component TrackShelf inherits VerticalLayout {
         }
         menu(x, y) => {
             Bridge.track-menu(root.index, i, x, y);
+        }
+        hover-start => {
+            Bridge.track-hover(root.index, i);
         }
     }
 }

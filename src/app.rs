@@ -117,6 +117,8 @@ struct State {
     autoplay_seed: Option<String>,
     /// Queue thumbnails were requested for the current queue rows.
     queue_images: Option<std::ops::Range<usize>>,
+    /// The early stream lookup in progress: (video id, task).
+    warming: Option<(String, AbortHandle)>,
     /// Bumped only when the whole queue is replaced; radio results for an
     /// older queue are dropped (jumping within the queue keeps them).
     queue_gen: u64,
@@ -216,6 +218,8 @@ pub struct App {
     pub persist: std::cell::Cell<bool>,
     /// Debounces saving after volume changes.
     save_timer: Timer,
+    /// Waits a moment on a hovered song before looking its stream up.
+    warm_timer: Timer,
     st: RefCell<State>,
     pub settings: RefCell<Settings>,
 }
@@ -265,6 +269,7 @@ impl App {
             http,
             persist: std::cell::Cell::new(true),
             save_timer: Timer::default(),
+            warm_timer: Timer::default(),
             st: RefCell::new(State { visible: true, rng: seed | 1, last_volume, ..Default::default() }),
             settings: RefCell::new(settings),
         });
@@ -302,6 +307,24 @@ impl App {
             if let Some(a) = app() {
                 if si >= 0 && row >= 0 {
                     a.track_clicked(si as usize, row as usize);
+                }
+            }
+        });
+        b.on_track_hover(|si, row| {
+            if let Some(a) = app() {
+                if si >= 0 && row >= 0 {
+                    let id = a.st.borrow().page.shelves.get(si as usize).and_then(|s| s.items.get(row as usize)).filter(|i| i.kind.playable()).map(|i| i.id.clone());
+                    if let Some(id) = id {
+                        a.warm_soon(id);
+                    }
+                }
+            }
+        });
+        b.on_queue_hover(|i| {
+            if let Some(a) = app() {
+                let id = a.st.borrow().queue.get(i.max(0) as usize).map(|q| q.id.clone());
+                if let Some(id) = id {
+                    a.warm_soon(id);
                 }
             }
         });
@@ -642,11 +665,17 @@ impl App {
             models.push(m);
         }
         ui.set_shelves(ModelRc::from(shelves.clone()));
+        // Albums and playlists are usually played from the top.
+        let first = matches!(page.header, Header::Collection { .. }).then(|| page.play.first().map(|i| i.id.clone())).flatten();
         let mut st = self.st.borrow_mut();
         st.page = page;
         st.page_stale = false;
         st.shelf_models = models;
         st.shelves_model = Some(shelves);
+        drop(st);
+        if let Some(id) = first {
+            self.warm(id);
+        }
     }
 
     fn load_more(self: &Rc<Self>) {
@@ -1078,6 +1107,40 @@ impl App {
         });
     }
 
+    /// The pointer rests on a song: look its stream up if it stays there a
+    /// moment, so clicking it starts playback sooner.
+    fn warm_soon(&self, id: String) {
+        self.warm_timer.start(TimerMode::SingleShot, Duration::from_millis(250), move || {
+            if let Some(a) = app() {
+                a.warm(id.clone());
+            }
+        });
+    }
+
+    /// Looks a song's stream URL up ahead of time (one at a time; a newer
+    /// one replaces it). Skipped behind a fullscreen game and for songs
+    /// already playing or prepared.
+    fn warm(&self, id: String) {
+        {
+            let st = self.st.borrow();
+            if st.game_mode || st.current().is_some_and(|c| c.id == id) || st.downloads.iter().any(|(d, _)| *d == id) {
+                return;
+            }
+            if st.warming.as_ref().is_some_and(|(w, h)| *w == id && !h.is_finished()) {
+                return;
+            }
+        }
+        if let Some((_, h)) = self.st.borrow_mut().warming.take() {
+            h.abort();
+        }
+        let res = self.res.clone();
+        let cookie = self.yt.cookie();
+        let quality = self.quality_for(&id);
+        let vid = id.clone();
+        let h = self.rt.spawn(async move { res.warm(&vid, cookie, quality).await });
+        self.st.borrow_mut().warming = Some((id, h.abort_handle()));
+    }
+
     /// More songs couldn't be fetched. If playback was waiting on them, say so
     /// instead of staying silent; the next track change tries again.
     fn radio_failed(self: &Rc<Self>) {
@@ -1159,6 +1222,12 @@ impl App {
             let Some(item) = st.current().cloned() else { return };
             let next = st.next_id();
             st.pending_advance = false;
+            // An early lookup for another song would compete with this one.
+            if st.warming.as_ref().is_some_and(|(w, _)| *w != item.id) {
+                if let Some((_, h)) = st.warming.take() {
+                    h.abort();
+                }
+            }
             let mut keep = vec![item.id.as_str()];
             if let Some(n) = &next {
                 keep.push(n);
