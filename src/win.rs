@@ -182,8 +182,9 @@ unsafe extern "system" fn paint_hook(h: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
 
 /// Slint applies a new display scale at once but keeps the old window size
 /// until a resize arrives, and none comes in some cases (the renderer skips
-/// frames meanwhile). Shortly after a scale change, make sure Slint's size
-/// matches the real window and everything gets redrawn.
+/// frames meanwhile). Shortly after a scale change, tell Slint the window's
+/// real size and redraw. Only Slint hears about it: asking Windows to resize
+/// here would fight a maximize or restore in progress.
 pub fn after_scale_change(ui: &crate::AppWindow) {
     use slint::ComponentHandle;
     let weak = ui.as_weak();
@@ -191,13 +192,12 @@ pub fn after_scale_change(ui: &crate::AppWindow) {
         let Some(ui) = weak.upgrade() else { return };
         let Some(h) = hwnd(ui.window()) else { return };
         let mut r = windows::Win32::Foundation::RECT::default();
-        if unsafe { windows::Win32::UI::WindowsAndMessaging::GetClientRect(h, &mut r) }.is_err() {
-            return;
-        }
-        let (w, ht) = ((r.right - r.left) as u32, (r.bottom - r.top) as u32);
-        // A logical size the scale can't reach yet also needs this nudge.
-        if w > 0 && ht > 0 {
-            ui.window().set_size(slint::PhysicalSize::new(w, ht));
+        let known = unsafe { windows::Win32::UI::WindowsAndMessaging::GetClientRect(h, &mut r) }.is_ok();
+        let (w, ht) = ((r.right - r.left) as f32, (r.bottom - r.top) as f32);
+        if known && w >= 1.0 && ht >= 1.0 && !unsafe { IsIconic(h) }.as_bool() {
+            let scale = ui.window().scale_factor();
+            let size = slint::LogicalSize::new(w / scale, ht / scale);
+            ui.window().dispatch_event(slint::platform::WindowEvent::Resized { size });
         }
         full_repaint(&ui);
     });
