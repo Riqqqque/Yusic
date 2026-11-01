@@ -7,8 +7,11 @@ use serde::{Deserialize, Serialize};
 pub struct Settings {
     pub volume: f32,
     pub sidebar_wide: bool,
-    pub width: u32,
-    pub height: u32,
+    /// Window size in logical pixels, independent of display scaling.
+    /// (Older versions stored physical pixels as `width`/`height`; restoring
+    /// those at scale 1 made the window grow on every launch. They're ignored.)
+    pub window_width: f32,
+    pub window_height: f32,
     pub maximized: bool,
     /// "best" or "standard" (128 kbps AAC only).
     pub quality: String,
@@ -44,8 +47,8 @@ impl Default for Settings {
         Self {
             volume: 0.5,
             sidebar_wide: true,
-            width: 0,
-            height: 0,
+            window_width: 0.0,
+            window_height: 0.0,
             maximized: false,
             quality: "best".into(),
             autoplay: true,

@@ -180,6 +180,29 @@ unsafe extern "system" fn paint_hook(h: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
     unsafe { CallWindowProcW(old, h, msg, w, l) }
 }
 
+/// Slint applies a new display scale at once but keeps the old window size
+/// until a resize arrives, and none comes in some cases (the renderer skips
+/// frames meanwhile). Shortly after a scale change, make sure Slint's size
+/// matches the real window and everything gets redrawn.
+pub fn after_scale_change(ui: &crate::AppWindow) {
+    use slint::ComponentHandle;
+    let weak = ui.as_weak();
+    slint::Timer::single_shot(std::time::Duration::from_millis(250), move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let Some(h) = hwnd(ui.window()) else { return };
+        let mut r = windows::Win32::Foundation::RECT::default();
+        if unsafe { windows::Win32::UI::WindowsAndMessaging::GetClientRect(h, &mut r) }.is_err() {
+            return;
+        }
+        let (w, ht) = ((r.right - r.left) as u32, (r.bottom - r.top) as u32);
+        // A logical size the scale can't reach yet also needs this nudge.
+        if w > 0 && ht > 0 {
+            ui.window().set_size(slint::PhysicalSize::new(w, ht));
+        }
+        full_repaint(&ui);
+    });
+}
+
 /// Repaints after events where Windows may have dropped the contents but no
 /// paint arrives (e.g. a DPI change).
 pub fn repaint_on_window_events(ui: &crate::AppWindow) {
@@ -191,6 +214,9 @@ pub fn repaint_on_window_events(ui: &crate::AppWindow) {
         if matches!(event, WindowEvent::Occluded(false) | WindowEvent::ScaleFactorChanged { .. }) {
             if let Some(ui) = weak.upgrade() {
                 full_repaint(&ui);
+                if matches!(event, WindowEvent::ScaleFactorChanged { .. }) {
+                    after_scale_change(&ui);
+                }
             }
         }
         // Minimize and restore arrive as resizes; the progress tick follows
@@ -257,6 +283,29 @@ pub fn open_url(url: &str) {
 }
 
 /// Un-minimizes (without un-maximizing) and focuses the window.
+/// The largest window content that fits the primary monitor, in logical
+/// pixels. A window can't be larger than the screen: asking for that leaves
+/// Slint drawing a bigger window than the one it has a buffer for, and the
+/// software renderer panics.
+pub fn max_window_size() -> Option<(f32, f32)> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint};
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+    unsafe {
+        let mon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(mon, &mut info).as_bool() {
+            return None;
+        }
+        let (mut dpi_x, mut dpi_y) = (96u32, 96u32);
+        let _ = GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+        let scale = dpi_x.max(96) as f32 / 96.0;
+        let r = info.rcWork;
+        // Room for the window frame and title bar.
+        Some(((r.right - r.left) as f32 / scale - 16.0, (r.bottom - r.top) as f32 / scale - 48.0))
+    }
+}
+
 pub fn is_minimized(window: &slint::Window) -> bool {
     hwnd(window).is_some_and(|h| unsafe { IsIconic(h).as_bool() })
 }

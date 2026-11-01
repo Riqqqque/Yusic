@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use slint::{CloseRequestResponse, ComponentHandle, PhysicalSize};
+use slint::{CloseRequestResponse, ComponentHandle};
 
 use app::{App, Route};
 use resolver::Resolver;
@@ -108,10 +108,32 @@ fn log_panics() {
     }));
 }
 
+/// Ends the process here. Windows' media components fault while they're torn
+/// down at a normal exit, so that teardown is skipped.
+fn end_process(code: u32) -> ! {
+    unsafe {
+        use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+        let _ = TerminateProcess(GetCurrentProcess(), code);
+    }
+    std::process::exit(code as i32)
+}
+
 fn main() {
     log_panics();
-    if let Err(e) = run() {
-        win::error_box(&format!("{e:#}"));
+    let started = std::time::Instant::now();
+    match std::panic::catch_unwind(run) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => win::error_box(&format!("{e:#}")),
+        Err(_) => {
+            // Something in the window's event loop panicked (it's already in
+            // crash.log). Come back rather than vanish, unless it's failing
+            // right at startup, where reopening would just loop.
+            let testing = std::env::args().any(|a| a == "--snapshot" || a == "--exit-after");
+            if !testing && started.elapsed() > Duration::from_secs(20) {
+                let _ = install::spawn_restart();
+            }
+            end_process(1);
+        }
     }
 }
 
@@ -188,8 +210,10 @@ fn run() -> Result<()> {
     ui.set_app_icon(icon::slint_image(64));
     if let Some((w, h)) = args.size {
         ui.window().set_size(slint::LogicalSize::new(w as f32, h as f32));
-    } else if settings.width >= 400 && settings.height >= 300 {
-        ui.window().set_size(PhysicalSize::new(settings.width, settings.height));
+    } else if settings.window_width >= 400.0 && settings.window_height >= 300.0 {
+        // Logical: the display scale isn't known until the window exists.
+        let (max_w, max_h) = win::max_window_size().unwrap_or((settings.window_width, settings.window_height));
+        ui.window().set_size(slint::LogicalSize::new(settings.window_width.min(max_w), settings.window_height.min(max_h)));
     }
 
     let app = App::install(&ui, rt.handle().clone(), yt, res.clone(), dir.clone(), http.clone(), settings)?;
@@ -300,13 +324,8 @@ fn run() -> Result<()> {
     drop(tray);
     drop(update_watch);
     rt.shutdown_timeout(Duration::from_millis(300));
-    // Everything is saved. Windows' media components fault while they're torn
-    // down at a normal exit, so end here without running that teardown.
-    unsafe {
-        use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
-        let _ = TerminateProcess(GetCurrentProcess(), 0);
-    }
-    Ok(())
+    // Everything is saved.
+    end_process(0)
 }
 
 /// Puts the window into states that are otherwise hard to reach, for

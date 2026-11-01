@@ -1806,8 +1806,9 @@ impl App {
         let size = ui.window().size();
         s.maximized = ui.window().is_maximized();
         if !s.maximized && size.width >= 400 && !crate::win::is_minimized(ui.window()) {
-            s.width = size.width;
-            s.height = size.height;
+            let logical = size.to_logical(ui.window().scale_factor());
+            s.window_width = logical.width;
+            s.window_height = logical.height;
         }
         s.sidebar_wide = ui.get_sidebar_wide();
         if self.persist.get() {
