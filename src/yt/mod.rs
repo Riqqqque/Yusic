@@ -88,7 +88,10 @@ impl Yt {
             // Error reports hold whole responses (including the user's
             // library) in plain text; don't write them.
             .no_reporter()
-            .build()?;
+            // music.youtube.com's HTTP/2 response to rustypipe's visitor-id
+            // request fails with a protocol error, and rustypipe 0.11.4
+            // panics on it. HTTP/1.1 works.
+            .build_with_client(reqwest::ClientBuilder::new().http1_only())?;
         let _ = std::fs::remove_dir_all(storage.join("rustypipe_reports"));
         let cookies = CookieStore(data_dir.join("auth.bin"));
         let cookie = RwLock::new(cookies.load());
@@ -495,6 +498,7 @@ impl Yt {
                 thumb: best_thumb(&a.header_image),
             },
             radio: a.radio_id.clone(),
+            songs_playlist: a.tracks_playlist_id.clone(),
             play: top,
             shelves,
             actions,
@@ -624,6 +628,12 @@ impl Yt {
             album: t.album.as_ref().map(|a| a.name.as_str()),
             duration: t.duration,
         };
+        // Timed for this exact track, so they beat anything matched by name.
+        if let Some(id) = &details.lyrics_id {
+            if let Some(l) = self.timed_lyrics(id).await {
+                return Ok(Some(l));
+            }
+        }
         let ytm = async {
             let id = details.lyrics_id.as_ref()?;
             let l = self.q().music_lyrics(id).await.ok()?;
@@ -642,6 +652,38 @@ impl Yt {
             (_, Some(y)) => Some(y),
             (l, None) => l,
         })
+    }
+
+    /// YouTube Music's timed lyrics. Only its mobile client gets the
+    /// timestamps. None when the song has none or the request fails.
+    async fn timed_lyrics(&self, lyrics_id: &str) -> Option<lyrics::Lyrics> {
+        let gl = self.region.read().unwrap().clone();
+        let body = json!({
+            "browseId": lyrics_id,
+            "context": { "client": {
+                "clientName": "ANDROID_MUSIC",
+                "clientVersion": "7.21.50",
+                "androidSdkVersion": 34,
+                "hl": "en",
+                "gl": gl,
+            }},
+        });
+        let v: Value = self
+            .http
+            .post("https://music.youtube.com/youtubei/v1/browse?prettyPrint=false")
+            .header(reqwest::header::USER_AGENT, "com.google.android.apps.youtube.music/7.21.50 (Linux; U; Android 14) gzip")
+            .header(reqwest::header::ORIGIN, ORIGIN)
+            .timeout(std::time::Duration::from_secs(10))
+            .json(&body)
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        lyrics::parse_timed(&v)
     }
 
     // ------------------------------------------------------------ account actions
@@ -803,11 +845,17 @@ impl Yt {
     }
 
     /// Tracks to play when a card's play button is pressed.
-    pub async fn playable(&self, kind: Kind, id: &str) -> Result<Playable> {
+    /// `artist_songs`: an artist plays their own songs (then their radio)
+    /// instead of starting with the radio.
+    pub async fn playable(&self, kind: Kind, id: &str, artist_songs: bool) -> Result<Playable> {
         let from_page = |p: Page| Playable { items: p.play, seed: p.radio, more: track_continuation(p.continuation) };
         Ok(match kind {
             Kind::Album => from_page(self.album(id).await?),
             Kind::Playlist | Kind::Podcast => from_page(self.playlist(id).await?),
+            Kind::Artist if artist_songs => {
+                let page = self.artist(id).await?;
+                Playable { items: page.play, seed: page.radio, more: page.songs_playlist.map(Continuation::Playlist) }
+            }
             Kind::Artist => {
                 let page = self.artist(id).await?;
                 let items = match &page.radio {
@@ -836,6 +884,7 @@ impl Yt {
                     self.playlist_more(&t).await.map(|(i, n)| (i, n.map(Continuation::PlaylistRows)))
                 }
                 Some(Continuation::Tracks(p)) => self.more_tracks(&p).await.map(|(i, n)| (i, n.map(Continuation::Tracks))),
+                Some(Continuation::Playlist(id)) => self.playlist(&id).await.map(|p| (p.play, track_continuation(p.continuation))),
                 _ => break,
             };
             let Ok((items, more)) = page else { break };
@@ -867,7 +916,7 @@ pub fn row_key(i: &Item) -> String {
 
 /// Only track-list continuations can extend a queue.
 pub fn track_continuation(c: Option<Continuation>) -> Option<Continuation> {
-    c.filter(|c| matches!(c, Continuation::PlaylistRows(_) | Continuation::Tracks(_)))
+    c.filter(|c| matches!(c, Continuation::PlaylistRows(_) | Continuation::Tracks(_) | Continuation::Playlist(_)))
 }
 
 /// The mix YouTube Music plays after a playlist: built from the whole
@@ -1016,6 +1065,35 @@ fn playlist_item(p: &MusicPlaylistItem) -> Item {
 #[cfg(test)]
 mod network_tests {
     use super::*;
+
+    /// A song with YouTube timed lyrics gets them, not a name match:
+    /// `cargo test -- --ignored timed_lyrics --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn timed_lyrics_load() {
+        let dir = std::env::temp_dir().join(format!("yusic-lyrics-{}", std::process::id()));
+        let yt = Yt::new(&dir, reqwest::Client::new()).unwrap();
+        let l = yt.lyrics("5yrYHJtOTOc").await.unwrap().expect("lyrics");
+        println!("source {}", l.source);
+        assert!(matches!(l.body, lyrics::LyricsBody::Synced(_)));
+        assert_eq!(l.source, "LyricFind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Playing a song on an artist's page queues all their songs:
+    /// `cargo test -- --ignored artist_songs --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn artist_songs_load() {
+        let dir = std::env::temp_dir().join(format!("yusic-artist-{}", std::process::id()));
+        let yt = Yt::new(&dir, reqwest::Client::new()).unwrap();
+        let page = yt.artist("UCRr1xG_2WIDs18a6cIiCxeA").await.unwrap();
+        let id = page.songs_playlist.clone().expect("an artist song list");
+        let rest = yt.rest_of(Continuation::Playlist(id), &page.play).await;
+        println!("top songs {}, rest of their songs {}", page.play.len(), rest.len());
+        assert!(rest.len() > 20);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Playing a long playlist queues all of it, not just the first page:
     /// `cargo test -- --ignored long_playlist`.

@@ -30,6 +30,13 @@ pub struct Settings {
     /// Content region (ISO country code).
     pub region: String,
     pub auto_update: bool,
+    /// After a song started from an artist's page: "shuffle" (their songs,
+    /// shuffled), "order" (their songs in order) or "radio".
+    pub artist_play: String,
+    /// Shuffle albums, playlists and artists whenever they're played.
+    pub always_shuffle: bool,
+    /// Let autoplay learn from what's finished and what's skipped.
+    pub smart_autoplay: bool,
 }
 
 impl Default for Settings {
@@ -52,6 +59,9 @@ impl Default for Settings {
             accent: "#ff0000".into(),
             region: "US".into(),
             auto_update: true,
+            artist_play: "shuffle".into(),
+            always_shuffle: false,
+            smart_autoplay: true,
         }
     }
 }

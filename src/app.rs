@@ -2,7 +2,7 @@
 //! the signed-in session.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -23,7 +23,7 @@ use crate::resolver::{Quality, Resolver};
 use crate::settings::Settings;
 use crate::yt::Yt;
 use crate::yt::lyrics::{self, LyricsBody};
-use crate::{AppWindow, Bridge, CardData, HeaderData, NowData, ShelfData, TrackData};
+use crate::{AppWindow, Bridge, CardData, HeaderData, LinkSeg, NowData, ShelfData, TrackData};
 
 mod actions;
 use actions::{DialogMode, MenuTarget};
@@ -117,6 +117,17 @@ struct State {
     autoplay_seed: Option<String>,
     /// Queue thumbnails were requested for the current queue rows.
     queue_images: Option<std::ops::Range<usize>>,
+    /// The queue's ids in their original (unshuffled) order, so turning
+    /// shuffle off plays on from the current song top to bottom.
+    queue_orig: Vec<String>,
+    /// Songs that came from radio or autoplay (not picked by the user).
+    autoplay_ids: HashSet<String>,
+    /// Radio/autoplay songs skipped early in a row.
+    autoplay_skips: u32,
+    /// The last song the user listened to most of.
+    last_good: Option<String>,
+    /// When the current song was started (shown), for judging skips.
+    track_started: Option<Instant>,
     /// The early stream lookup in progress: (video id, task).
     warming: Option<(String, AbortHandle)>,
     /// Bumped only when the whole queue is replaced; radio results for an
@@ -138,6 +149,7 @@ struct State {
     lyrics_for: Option<String>,
     /// Line start times (ms) when the lyrics are synced.
     lyrics_times: Vec<u32>,
+    lyrics_retries: u32,
     tick_ms: u64,
     /// A fullscreen game/app has the screen: skip redraws.
     game_mode: bool,
@@ -145,6 +157,14 @@ struct State {
     toast_gen: u64,
     visible: bool,
     rng: u64,
+}
+
+const LYRICS_LEAD_MS: u32 = 100;
+
+/// Runs one UI-thread job. A panic in it ends that job only (the panic hook
+/// logs it), so a bug can't close the app while music plays.
+pub fn contain(f: impl FnOnce()) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
 }
 
 const PAGE_CACHE_SIZE: usize = 12;
@@ -170,6 +190,18 @@ impl State {
     }
 
     /// Cancels downloads for tracks that are no longer current or next.
+    /// Appends radio/autoplay songs that aren't queued yet.
+    fn push_autoplay(&mut self, items: Vec<Item>) {
+        let mut have: HashSet<String> = self.queue.iter().map(|i| i.id.clone()).collect();
+        for it in items {
+            if it.kind.playable() && !it.id.is_empty() && have.insert(it.id.clone()) {
+                self.queue_orig.push(it.id.clone());
+                self.autoplay_ids.insert(it.id.clone());
+                self.queue.push(it);
+            }
+        }
+    }
+
     fn prune_downloads(&mut self, keep: &[&str]) {
         self.downloads.retain(|(id, h)| {
             if h.is_finished() {
@@ -212,7 +244,6 @@ pub struct App {
     tick: Timer,
     queue_model: Rc<VecModel<TrackData>>,
     sidebar_model: Rc<VecModel<CardData>>,
-    profile_wipe: RefCell<Option<AbortHandle>>,
     http: reqwest::Client,
     /// Save settings changes to disk (off for test runs).
     pub persist: std::cell::Cell<bool>,
@@ -220,6 +251,9 @@ pub struct App {
     save_timer: Timer,
     /// Waits a moment on a hovered song before looking its stream up.
     warm_timer: Timer,
+    /// What the user finishes and skips (smarter autoplay).
+    taste: RefCell<crate::taste::Taste>,
+    taste_timer: Timer,
     st: RefCell<State>,
     pub settings: RefCell<Settings>,
 }
@@ -236,9 +270,11 @@ impl App {
     ) -> Result<Rc<App>> {
         let player = Player::new(|ev| {
             let _ = slint::invoke_from_event_loop(move || {
-                if let Some(app) = app() {
-                    app.on_player_event(ev);
-                }
+                contain(|| {
+                    if let Some(app) = app() {
+                        app.on_player_event(ev);
+                    }
+                });
             });
         })?;
         player.set_volume(settings.volume);
@@ -255,6 +291,7 @@ impl App {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x9E37_79B9_7F4A_7C15);
         let last_volume = if settings.volume > 0.0 { settings.volume } else { 0.5 };
+        let taste = crate::taste::Taste::load(&data_dir);
         let app = Rc::new(App {
             ui: ui.as_weak(),
             rt,
@@ -265,11 +302,12 @@ impl App {
             tick: Timer::default(),
             queue_model,
             sidebar_model,
-            profile_wipe: RefCell::new(None),
             http,
             persist: std::cell::Cell::new(true),
             save_timer: Timer::default(),
             warm_timer: Timer::default(),
+            taste: RefCell::new(taste),
+            taste_timer: Timer::default(),
             st: RefCell::new(State { visible: true, rng: seed | 1, last_volume, ..Default::default() }),
             settings: RefCell::new(settings),
         });
@@ -283,9 +321,11 @@ impl App {
         let b = ui.global::<Bridge>();
         fn with(f: impl Fn(&Rc<App>) + 'static) -> impl Fn() + 'static {
             move || {
-                if let Some(a) = app() {
-                    f(&a)
-                }
+                contain(|| {
+                    if let Some(a) = app() {
+                        f(&a)
+                    }
+                });
             }
         }
         b.on_navigate(|kind, id| {
@@ -399,6 +439,11 @@ impl App {
         }));
         b.on_account(with(|a| a.account_clicked()));
         b.on_sign_in(with(|a| a.sign_in()));
+        b.on_forget_accounts(|| {
+            if let Some(a) = app() {
+                a.forget_accounts();
+            }
+        });
         b.on_sign_out(with(|a| a.sign_out()));
         b.on_np_changed(with(|a| a.np_changed()));
         b.on_track_menu(|si, row, x, y| {
@@ -497,9 +542,11 @@ impl App {
             .spawn(async move {
                 let v = fut.await;
                 let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(app) = app() {
-                        done(&app, v);
-                    }
+                    contain(|| {
+                        if let Some(app) = app() {
+                            done(&app, v);
+                        }
+                    });
                 });
             })
             .abort_handle()
@@ -728,6 +775,7 @@ impl App {
                     move |app, res| app.append_tracks(tok, res.map(|(i, n)| (i, n.map(Continuation::Tracks)))),
                 );
             }
+            Continuation::Playlist(_) => self.st.borrow_mut().loading_more = false,
         }
     }
 
@@ -820,12 +868,20 @@ impl App {
         let yt = self.yt.clone();
         let id = c.id.to_string();
         let req = self.st.borrow().play_req;
+        let artist_mode = self.settings.borrow().artist_play.clone();
+        let artist_songs = artist_mode != "radio";
         self.spawn(
-            async move { yt.playable(kind, &id).await.map_err(|e| format!("{e:#}")) },
+            async move { yt.playable(kind, &id, artist_songs).await.map_err(|e| format!("{e:#}")) },
             move |app, p| match p {
                 _ if app.st.borrow().play_req != req => {}
                 Ok(p) if !p.items.is_empty() => {
-                    app.play_items(p.items, 0, false);
+                    let start = if app.wants_shuffle(kind == Kind::Artist && artist_mode == "shuffle") {
+                        app.set_shuffle_state(true);
+                        (app.rand() as usize) % p.items.len()
+                    } else {
+                        0
+                    };
+                    app.play_items(p.items, start, false);
                     app.queue_extras(p.seed, p.more);
                 }
                 Ok(_) => app.toast("Nothing to play here"),
@@ -856,9 +912,30 @@ impl App {
             self.open_card(&card);
             return;
         }
+        let (artist_page, artist_mode) = {
+            let st = self.st.borrow();
+            (matches!(st.page.header, Header::Artist { .. }), self.settings.borrow().artist_play.clone())
+        };
+        if artist_page && matches!(shelf_kind, ShelfKind::Tracks) && artist_mode != "radio" {
+            // The artist's songs (all of them, loading in the background),
+            // then their radio.
+            let playable: Vec<Item> = items.iter().filter(|i| i.kind.playable()).cloned().collect();
+            let start = playable.iter().position(|i| i.id == item.id).unwrap_or(0);
+            self.set_shuffle_state(self.wants_shuffle(artist_mode == "shuffle"));
+            let (seed, more) = {
+                let st = self.st.borrow();
+                (st.page.radio.clone(), st.page.songs_playlist.clone().map(Continuation::Playlist))
+            };
+            self.play_items(playable, start, false);
+            self.queue_extras(seed, more);
+            return;
+        }
         if shelf_kind.is_collection() {
             let playable: Vec<Item> = items.iter().filter(|i| i.kind.playable()).cloned().collect();
             let start = playable.iter().position(|i| i.id == item.id).unwrap_or(0);
+            if self.wants_shuffle(false) {
+                self.set_shuffle_state(true);
+            }
             let (seed, more) = {
                 let st = self.st.borrow();
                 // The page's continuation belongs to its (first) track list.
@@ -873,16 +950,18 @@ impl App {
     }
 
     fn play_header(self: &Rc<Self>, shuffle: bool) {
-        let (items, seed, more) = {
+        let (items, seed, more, artist) = {
             let st = self.st.borrow();
-            (st.page.play.clone(), st.page.radio.clone(), crate::yt::track_continuation(st.page.continuation.clone()))
+            let more = crate::yt::track_continuation(st.page.continuation.clone())
+                .or_else(|| st.page.songs_playlist.clone().map(Continuation::Playlist));
+            (st.page.play.clone(), st.page.radio.clone(), more, matches!(st.page.header, Header::Artist { .. }))
         };
         if items.is_empty() {
             return;
         }
-        if shuffle {
-            self.st.borrow_mut().shuffle = true;
-            self.ui().set_shuffle(true);
+        let artist_shuffle = artist && self.settings.borrow().artist_play == "shuffle";
+        if self.wants_shuffle(shuffle || artist_shuffle) {
+            self.set_shuffle_state(true);
             let start = (self.rand() as usize) % items.len();
             self.play_items(items, start, false);
         } else {
@@ -945,6 +1024,9 @@ impl App {
             let mut st = self.st.borrow_mut();
             st.play_req += 1;
             st.queue_gen += 1;
+            st.queue_orig = items.iter().map(|i| i.id.clone()).collect();
+            st.autoplay_ids.clear();
+            st.autoplay_skips = 0;
             st.queue = items;
             st.qi = start;
             st.radio_more = None;
@@ -985,8 +1067,7 @@ impl App {
                             return;
                         };
                         // Songs queued meanwhile stay; the radio goes after them.
-                        let have: HashSet<String> = st.queue.iter().map(|i| i.id.clone()).collect();
-                        st.queue.extend(items.into_iter().filter(|i| i.kind.playable() && !have.contains(&i.id)));
+                        st.push_autoplay(app.taste_filter(items));
                         st.radio_more = more;
                     }
                     app.refresh_queue();
@@ -1011,7 +1092,14 @@ impl App {
                 None => match st.autoplay_seed.take() {
                     Some(seed) => (None, None, Some(seed)),
                     None => {
-                        let last = st.queue.last().map(|i| i.id.clone()).unwrap_or_default();
+                        let mut last = st.queue.last().map(|i| i.id.clone()).unwrap_or_default();
+                        // Seed with the last song actually listened to when
+                        // the queue ended on songs that were skipped.
+                        if self.settings.borrow().smart_autoplay {
+                            if let Some(good) = st.last_good.clone() {
+                                last = good;
+                            }
+                        }
                         if st.autoplay_for.as_deref() == Some(last.as_str()) {
                             return;
                         }
@@ -1058,8 +1146,7 @@ impl App {
                         app.radio_failed();
                         return;
                     };
-                    let have: HashSet<String> = st.queue.iter().map(|i| i.id.clone()).collect();
-                    st.queue.extend(items.into_iter().filter(|i| i.kind.playable() && !have.contains(&i.id)));
+                    st.push_autoplay(app.taste_filter(items));
                     st.radio_more = more;
                 }
                 app.refresh_queue();
@@ -1094,7 +1181,9 @@ impl App {
                 st.radio_busy = false;
                 let have: HashSet<String> = st.queue.iter().map(|i| i.id.clone()).collect();
                 let before = st.queue.len();
-                st.queue.extend(items.into_iter().filter(|i| i.kind.playable() && !i.id.is_empty() && !have.contains(&i.id)));
+                let new: Vec<Item> = items.into_iter().filter(|i| i.kind.playable() && !i.id.is_empty() && !have.contains(&i.id)).collect();
+                st.queue_orig.extend(new.iter().map(|i| i.id.clone()));
+                st.queue.extend(new);
                 (st.shuffle, st.qi, st.queue.len() > before)
             };
             if added && shuffle {
@@ -1168,6 +1257,7 @@ impl App {
             .map(|(i, it)| {
                 let mut d = track_data(it, i, i == qi);
                 d.subtitle = if it.artists.is_empty() { it.subtitle.clone() } else { it.artist_names() }.into();
+                d.subtitle_links = d.artist_links.clone();
                 d
             })
             .collect();
@@ -1219,6 +1309,7 @@ impl App {
             st.play_gen += 1;
             st.has_source = false;
             st.loaded_at = None;
+            st.track_started = Some(Instant::now());
             let Some(item) = st.current().cloned() else { return };
             let next = st.next_id();
             st.pending_advance = false;
@@ -1253,6 +1344,7 @@ impl App {
             album: item.album.as_ref().map(|a| a.name.as_str()).unwrap_or_default().into(),
             artist_id: item.first_artist_id().unwrap_or_default().into(),
             album_id: item.album.as_ref().and_then(|a| a.id.as_deref()).unwrap_or_default().into(),
+            artist_links: seg_model(link_segs(&item.artist_names(), &item, false)),
             ..Default::default()
         });
         ui.set_buffering(true);
@@ -1302,6 +1394,7 @@ impl App {
             st.has_source = true;
             st.loaded_at = Some(Instant::now());
         }
+        self.update_timer();
         self.prefetch_next();
     }
 
@@ -1439,8 +1532,140 @@ impl App {
 
     /// Next button / media key: always moves to the next track.
     fn skip(self: &Rc<Self>) {
+        self.judge_skip();
         self.st.borrow_mut().fail_streak = 0;
         self.advance(false);
+    }
+
+    /// Next pressed: a song left early counts against it (and its artist),
+    /// one mostly heard counts for it.
+    fn judge_skip(self: &Rc<Self>) {
+        let (item, has_source, started) = {
+            let st = self.st.borrow();
+            (st.current().cloned(), st.has_source, st.track_started)
+        };
+        let Some(item) = item else { return };
+        let (pos, dur) = if has_source { self.player.position() } else { (0.0, 0.0) };
+        if has_source && dur > 0.0 && pos / dur >= 0.7 {
+            self.note_played(&item);
+        } else if has_source && (pos < 30.0 || pos / dur.max(1.0) < 0.4) {
+            self.note_skipped(&item, 1);
+        } else if !has_source && started.is_some_and(|t| t.elapsed() > Duration::from_secs(2)) {
+            // Skipped while it was still loading, after seeing what it was.
+            self.note_skipped(&item, 1);
+        }
+    }
+
+    pub(super) fn note_played(&self, item: &Item) {
+        self.taste.borrow_mut().played(&item.id, item.first_artist_id());
+        {
+            let mut st = self.st.borrow_mut();
+            st.last_good = Some(item.id.clone());
+            st.autoplay_skips = 0;
+        }
+        self.save_taste_soon();
+    }
+
+    pub(super) fn note_skipped(self: &Rc<Self>, item: &Item, weight: u32) {
+        self.taste.borrow_mut().skipped(&item.id, item.first_artist_id(), weight);
+        self.save_taste_soon();
+        let drifting = {
+            let mut st = self.st.borrow_mut();
+            if st.autoplay_ids.contains(&item.id) {
+                st.autoplay_skips += 1;
+            }
+            st.autoplay_skips >= 2
+        };
+        if drifting && self.settings.borrow().smart_autoplay {
+            self.reseed_autoplay();
+        }
+    }
+
+    fn save_taste_soon(&self) {
+        if !self.persist.get() {
+            return;
+        }
+        self.taste_timer.start(TimerMode::SingleShot, Duration::from_secs(15), || {
+            if let Some(a) = app() {
+                a.taste.borrow_mut().save();
+            }
+        });
+    }
+
+    /// Radio/autoplay songs the user keeps skipping and artists they skip far
+    /// more than they play are left out (unless that would leave nothing).
+    fn taste_filter(&self, items: Vec<Item>) -> Vec<Item> {
+        if !self.settings.borrow().smart_autoplay {
+            return items;
+        }
+        let t = self.taste.borrow();
+        let kept: Vec<Item> = items
+            .iter()
+            .filter(|i| !t.unwanted_track(&i.id) && !i.first_artist_id().is_some_and(|a| t.unwanted_artist(a)))
+            .cloned()
+            .collect();
+        if kept.is_empty() { items } else { kept }
+    }
+
+    /// Two radio/autoplay songs skipped early in a row: the mix has drifted.
+    /// Drop the rest of it and start again from the last song listened to.
+    fn reseed_autoplay(self: &Rc<Self>) {
+        let (seed, qgen) = {
+            let mut st = self.st.borrow_mut();
+            st.autoplay_skips = 0;
+            let Some(seed) = st.last_good.clone() else { return };
+            if st.radio_busy || st.repeat != 0 {
+                return;
+            }
+            let qi = st.qi;
+            let ids = st.autoplay_ids.clone();
+            let mut i = qi + 1;
+            while i < st.queue.len() {
+                if ids.contains(&st.queue[i].id) {
+                    st.queue.remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+            st.radio_more = None;
+            st.autoplay_seed = None;
+            st.autoplay_for = Some(seed.clone());
+            st.radio_busy = true;
+            (seed, st.queue_gen)
+        };
+        self.toast("Autoplay is steering back toward what you like.");
+        self.refresh_queue();
+        let yt = self.yt.clone();
+        self.spawn(async move { yt.radio(&seed).await.ok() }, move |app, r| {
+            {
+                let mut st = app.st.borrow_mut();
+                if st.queue_gen != qgen {
+                    return;
+                }
+                st.radio_busy = false;
+                let Some((items, more)) = r else {
+                    drop(st);
+                    app.radio_failed();
+                    return;
+                };
+                st.push_autoplay(app.taste_filter(items));
+                st.radio_more = more;
+            }
+            app.refresh_queue();
+            app.resume_if_waiting();
+            app.prefetch_next();
+        });
+    }
+
+    /// Whether a play should shuffle: the "Always shuffle" setting, or what
+    /// the caller asks for.
+    pub(super) fn wants_shuffle(&self, asked: bool) -> bool {
+        asked || self.settings.borrow().always_shuffle
+    }
+
+    pub(super) fn set_shuffle_state(&self, on: bool) {
+        self.st.borrow_mut().shuffle = on;
+        self.ui().set_shuffle(on);
     }
 
     /// `auto`: the track ended by itself (repeat-one replays it).
@@ -1524,9 +1749,36 @@ impl App {
         if on {
             let qi = self.st.borrow().qi;
             self.shuffle_after(qi);
-            self.refresh_queue();
-            self.prefetch_next();
+        } else {
+            self.unshuffle();
         }
+        self.refresh_queue();
+        self.prefetch_next();
+    }
+
+    /// Puts the queue back in its original order and carries on from the
+    /// current song, so a shuffled playlist plays on top to bottom.
+    fn unshuffle(&self) {
+        let mut st = self.st.borrow_mut();
+        let Some(cur) = st.current().map(|c| c.id.clone()) else { return };
+        let old = std::mem::take(&mut st.queue);
+        let mut slots: HashMap<String, std::collections::VecDeque<usize>> = HashMap::new();
+        for (i, it) in old.iter().enumerate() {
+            slots.entry(it.id.clone()).or_default().push_back(i);
+        }
+        let mut taken = vec![false; old.len()];
+        let mut order: Vec<usize> = Vec::with_capacity(old.len());
+        for id in &st.queue_orig {
+            if let Some(i) = slots.get_mut(id).and_then(|q| q.pop_front()) {
+                taken[i] = true;
+                order.push(i);
+            }
+        }
+        // Anything not in the original list keeps its place at the end.
+        order.extend((0..old.len()).filter(|i| !taken[*i]));
+        let mut old: Vec<Option<Item>> = old.into_iter().map(Some).collect();
+        st.queue = order.into_iter().filter_map(|i| old[i].take()).collect();
+        st.qi = st.queue.iter().position(|i| i.id == cur).unwrap_or(0);
     }
 
     pub fn set_volume(&self, v: f32) {
@@ -1603,6 +1855,12 @@ impl App {
                     self.decode_failed(tok, &title, "the file could not be decoded");
                 } else {
                     self.st.borrow_mut().fail_streak = 0;
+                    // Bound first: an `if let` would hold the borrow through its
+                    // body, and note_played changes the state.
+                    let item = self.st.borrow().current().cloned();
+                    if let Some(item) = item {
+                        self.note_played(&item);
+                    }
                     self.advance(true);
                 }
             }
@@ -1621,20 +1879,22 @@ impl App {
     }
 
     fn update_timer(&self) {
-        let (playing, visible, synced) = {
+        let (has_source, playing, visible, synced) = {
             let st = self.st.borrow();
-            (st.playing, st.visible, !st.lyrics_times.is_empty())
+            (st.has_source, st.playing, st.visible, !st.lyrics_times.is_empty())
         };
-        if !(playing && visible) || crate::win::is_minimized(self.ui().window()) {
+        // Keeps running while paused: playback events can arrive late or out
+        // of order, so the tick also checks what the player is really doing.
+        if !(has_source && visible) || crate::win::is_minimized(self.ui().window()) {
             self.tick.stop();
             return;
         }
         // Synced lyrics need a finer clock than the progress bar; while a
         // fullscreen game runs nothing is drawn, so only check now and then.
         let ms = if self.st.borrow().game_mode {
-            2000
-        } else if synced && self.lyrics_visible() {
-            150
+            1000
+        } else if playing && synced && self.lyrics_visible() {
+            100
         } else {
             500
         };
@@ -1643,9 +1903,11 @@ impl App {
         }
         self.st.borrow_mut().tick_ms = ms;
         self.tick.start(TimerMode::Repeated, Duration::from_millis(ms), || {
-            if let Some(app) = app() {
-                app.update_position();
-            }
+            contain(|| {
+                if let Some(app) = app() {
+                    app.update_position();
+                }
+            });
         });
     }
 
@@ -1660,10 +1922,22 @@ impl App {
         if game || !self.st.borrow().has_source {
             return;
         }
-        let (pos, dur) = self.player.position();
         let ui = self.ui();
+        // The player is the truth: a stale "stopped" event from the previous
+        // song must not leave the clock off while this one plays.
+        let playing = self.player.is_playing();
+        if playing != self.st.borrow().playing {
+            self.st.borrow_mut().playing = playing;
+            ui.set_playing(playing);
+            self.update_timer();
+        }
+        let (pos, dur) = self.player.position();
         if dur > 0.0 {
-            ui.set_progress((pos / dur).clamp(0.0, 1.0) as f32);
+            let progress = (pos / dur).clamp(0.0, 1.0) as f32;
+            // Redraw the bar only when it visibly moves.
+            if (progress - ui.get_progress()).abs() > 0.0005 {
+                ui.set_progress(progress);
+            }
             ui.set_time_text(format!("{} / {}", fmt_duration(pos as u32), fmt_duration(dur as u32)).into());
         }
         let active = {
@@ -1671,7 +1945,8 @@ impl App {
             if st.lyrics_times.is_empty() {
                 return;
             }
-            lyrics::active_line(&st.lyrics_times, (pos * 1000.0) as u32).map_or(-1, |i| i as i32)
+            // Slightly ahead, so a line lights up as it's sung rather than after.
+            lyrics::active_line(&st.lyrics_times, (pos * 1000.0) as u32 + LYRICS_LEAD_MS).map_or(-1, |i| i as i32)
         };
         if ui.get_lyrics_active() != active {
             ui.set_lyrics_active(active);
@@ -1700,6 +1975,7 @@ impl App {
             let mut st = self.st.borrow_mut();
             st.lyrics_for = None;
             st.lyrics_times.clear();
+            st.lyrics_retries = 0;
         }
         let ui = self.ui();
         ui.set_lyrics_state("".into());
@@ -1756,9 +2032,24 @@ impl App {
                     }
                     Ok(None) => ui.set_lyrics_state("none".into()),
                     Err(_) => {
-                        // Allow a retry the next time the tab is opened.
-                        app.st.borrow_mut().lyrics_for = None;
+                        // Allow a retry when the tab is opened again, and try
+                        // again by itself a few times.
+                        let tries = {
+                            let mut st = app.st.borrow_mut();
+                            st.lyrics_for = None;
+                            st.lyrics_retries += 1;
+                            st.lyrics_retries
+                        };
                         ui.set_lyrics_state("error".into());
+                        if tries <= 3 {
+                            Timer::single_shot(Duration::from_secs(5), || {
+                                if let Some(a) = crate::app::app() {
+                                    if a.lyrics_visible() {
+                                        a.ensure_lyrics();
+                                    }
+                                }
+                            });
+                        }
                     }
                 }
             },
@@ -1837,10 +2128,6 @@ impl App {
 
     pub fn sign_in(self: &Rc<Self>) {
         self.ui().set_account_open(false);
-        // Don't let a previous attempt's cleanup delete the new window's profile.
-        if let Some(h) = self.profile_wipe.borrow_mut().take() {
-            h.abort();
-        }
         let opened = login::open(
             &self.data_dir,
             crate::icon::slint_image(64),
@@ -1878,19 +2165,26 @@ impl App {
                 Err(e) => app.toast(format!("Sign-in failed: {e}")),
             },
         );
-        // The temporary browser profile is no longer needed once its
-        // processes have exited.
+    }
+
+    /// Deletes the sign-in window's remembered Google accounts.
+    fn forget_accounts(&self) {
+        login::close();
         let dir = self.data_dir.clone();
-        let wipe = self.rt.spawn(async move {
-            for _ in 0..20 {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                if !login::profile_dir(&dir).exists() {
-                    break;
+        // Its browser processes may take a moment to let go of the files.
+        self.spawn(
+            async move {
+                for _ in 0..10 {
+                    login::clear_profile(&dir);
+                    if !login::profile_dir(&dir).exists() {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                 }
-                login::clear_profile(&dir);
-            }
-        });
-        *self.profile_wipe.borrow_mut() = Some(wipe.abort_handle());
+                false
+            },
+            |app, done| app.toast(if done { "Forgot the remembered Google accounts." } else { "Couldn't remove them yet. Try again in a moment." }),
+        );
     }
 
     fn sign_out(self: &Rc<Self>) {
@@ -2003,6 +2297,9 @@ impl App {
 
     /// Releases the audio file and deletes every cached track.
     pub fn shutdown(&self) {
+        if self.persist.get() {
+            self.taste.borrow_mut().save();
+        }
         login::close();
         {
             let mut st = self.st.borrow_mut();
@@ -2047,16 +2344,100 @@ fn header_data(h: &Header) -> (HeaderData, Option<(String, u32, u32)>) {
 }
 
 fn card_data(it: &Item) -> CardData {
+    let subtitle = if it.subtitle.is_empty() { it.artist_names() } else { it.subtitle.clone() };
+    // About how many characters fit on a line of a card.
+    let (line1, line2) = split_lines(link_segs(&subtitle, it, true), if it.wide { 42 } else { 24 });
     CardData {
         kind: it.kind.as_str().into(),
         id: it.id.as_str().into(),
         playlist_id: it.playlist_id.as_str().into(),
         title: it.title.as_str().into(),
-        subtitle: if it.subtitle.is_empty() { it.artist_names() } else { it.subtitle.clone() }.into(),
+        subtitle: subtitle.into(),
         image: Image::default(),
         round: it.kind == Kind::Artist,
         wide: it.wide,
+        line1: seg_model(line1),
+        line2: seg_model(line2),
     }
+}
+
+/// `text` cut into plain pieces and links wherever the item's artist (and,
+/// with `with_album`, album) names appear in it, in order. Empty when no name
+/// with an id appears.
+fn link_segs(text: &str, it: &Item, with_album: bool) -> Vec<LinkSeg> {
+    let mut links: Vec<(&str, &str, &str)> = it
+        .artists
+        .iter()
+        .filter_map(|a| a.id.as_deref().filter(|id| !id.is_empty()).map(|id| (a.name.as_str(), "artist", id)))
+        .collect();
+    if with_album {
+        if let Some((al, id)) = it.album.as_ref().and_then(|a| a.id.as_deref().filter(|id| !id.is_empty()).map(|id| (a, id))) {
+            links.push((al.name.as_str(), "album", id));
+        }
+    }
+    let seg = |t: &str, kind: &str, id: &str| LinkSeg { text: t.into(), kind: kind.into(), id: id.into() };
+    let mut out = Vec::new();
+    let mut pos = 0;
+    let mut any = false;
+    for (name, kind, id) in links {
+        if name.is_empty() {
+            continue;
+        }
+        let Some(i) = text[pos..].find(name) else { continue };
+        if i > 0 {
+            out.push(seg(&text[pos..pos + i], "", ""));
+        }
+        out.push(seg(name, kind, id));
+        pos += i + name.len();
+        any = true;
+    }
+    if !any {
+        return Vec::new();
+    }
+    if pos < text.len() {
+        out.push(seg(&text[pos..], "", ""));
+    }
+    out
+}
+
+/// Splits pieces over two lines of about `budget` characters (the second
+/// line is shortened by the UI if it's still too long).
+fn split_lines(segs: Vec<LinkSeg>, budget: usize) -> (Vec<LinkSeg>, Vec<LinkSeg>) {
+    let (mut l1, mut l2) = (Vec::new(), Vec::new());
+    let mut used = 0;
+    let mut second = false;
+    for s in segs {
+        if second {
+            l2.push(s);
+            continue;
+        }
+        let n = s.text.chars().count();
+        if used + n <= budget {
+            used += n;
+            l1.push(s);
+            continue;
+        }
+        second = true;
+        if s.id.is_empty() {
+            // Break plain text at the last space that fits.
+            let room = budget - used;
+            let cut = s.text.char_indices().take(room + 1).filter(|(_, c)| *c == ' ').map(|(b, _)| b).last();
+            if let Some(b) = cut.filter(|b| *b > 0) {
+                let rest = s.text[b..].trim_start().to_owned();
+                l1.push(LinkSeg { text: s.text[..b].into(), ..s.clone() });
+                if !rest.is_empty() {
+                    l2.push(LinkSeg { text: rest.into(), ..s });
+                }
+                continue;
+            }
+        }
+        if l1.is_empty() { l1.push(s) } else { l2.push(s) }
+    }
+    (l1, l2)
+}
+
+fn seg_model(v: Vec<LinkSeg>) -> ModelRc<LinkSeg> {
+    if v.is_empty() { ModelRc::default() } else { ModelRc::new(VecModel::from(v)) }
 }
 
 fn track_data(it: &Item, idx: usize, active: bool) -> TrackData {
@@ -2072,6 +2453,8 @@ fn track_data(it: &Item, idx: usize, active: bool) -> TrackData {
         active,
         artist_id: it.first_artist_id().unwrap_or_default().into(),
         album_id: it.album.as_ref().and_then(|a| a.id.as_deref()).unwrap_or_default().into(),
+        subtitle_links: seg_model(link_segs(&it.row_subtitle(), it, true)),
+        artist_links: seg_model(link_segs(&it.artist_names(), it, false)),
     }
 }
 
@@ -2144,5 +2527,62 @@ fn set_active(model: &Rc<VecModel<TrackData>>, id: &str) {
                 model.set_row_data(i, d);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+    use crate::model::Link;
+
+    fn item() -> Item {
+        Item {
+            artists: vec![
+                Link { name: "Miranda Lambert".into(), id: Some("UC1".into()) },
+                Link { name: "Ella Langley".into(), id: Some("UC2".into()) },
+            ],
+            album: Some(Link { name: "Postcards".into(), id: Some("MPRE1".into()) }),
+            ..Default::default()
+        }
+    }
+
+    fn texts(v: &[LinkSeg]) -> Vec<(String, String)> {
+        v.iter().map(|s| (s.text.to_string(), s.id.to_string())).collect()
+    }
+
+    #[test]
+    fn names_become_links_in_place() {
+        let segs = link_segs("Song • Miranda Lambert & Ella Langley • Postcards", &item(), true);
+        assert_eq!(
+            texts(&segs),
+            vec![
+                ("Song • ".into(), "".into()),
+                ("Miranda Lambert".into(), "UC1".into()),
+                (" & ".into(), "".into()),
+                ("Ella Langley".into(), "UC2".into()),
+                (" • ".into(), "".into()),
+                ("Postcards".into(), "MPRE1".into()),
+            ]
+        );
+        // The pieces always add back up to the original text.
+        let joined: String = segs.iter().map(|s| s.text.to_string()).collect();
+        assert_eq!(joined, "Song • Miranda Lambert & Ella Langley • Postcards");
+    }
+
+    #[test]
+    fn no_links_without_ids() {
+        let it = Item { artists: vec![Link { name: "Someone".into(), id: None }], ..Default::default() };
+        assert!(link_segs("Someone • 3M views", &it, true).is_empty());
+    }
+
+    #[test]
+    fn splits_over_two_lines() {
+        let segs = link_segs("Playlist • Miranda Lambert, Ella Langley and more", &item(), false);
+        let (l1, l2) = split_lines(segs, 24);
+        let a: String = l1.iter().map(|s| s.text.to_string()).collect();
+        let b: String = l2.iter().map(|s| s.text.to_string()).collect();
+        assert!(a.chars().count() <= 26, "{a}");
+        assert!(!b.is_empty());
+        assert!(l2.iter().any(|s| s.id == "UC2"));
     }
 }

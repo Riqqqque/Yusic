@@ -1,5 +1,6 @@
-//! Lyrics: time-synced lyrics from LRCLIB (lrclib.net, a free open lyrics
-//! database) when available, otherwise YouTube Music's own plain lyrics.
+//! Lyrics, best first: YouTube Music's own timed lyrics (timed to the exact
+//! track being played), time-synced lyrics from LRCLIB (lrclib.net, a free
+//! open lyrics database), then YouTube Music's plain lyrics.
 //!
 //! Matching has to cope with video uploads ("Artist - Song (Official Video)
 //! ft. X | Cover"). A match that isn't clearly the same recording (another
@@ -48,6 +49,24 @@ impl LrcRecord {
             || self.synced_lyrics.as_deref().is_some_and(|s| !s.trim().is_empty())
             || self.plain_lyrics.as_deref().is_some_and(|s| !s.trim().is_empty())
     }
+}
+
+/// Reads YouTube Music's timed lyrics (from the mobile client's lyrics page).
+/// None unless every line has a start time; some sources come without.
+pub fn parse_timed(v: &serde_json::Value) -> Option<Lyrics> {
+    use serde_json::Value;
+    let rows = super::browse::find_key(v, "timedLyricsData")?.as_array()?;
+    let mut lines = Vec::with_capacity(rows.len());
+    for r in rows {
+        let start = r.pointer("/cueRange/startTimeMilliseconds")?.as_str()?.parse::<u32>().ok()?;
+        lines.push((start, r.get("lyricLine").and_then(Value::as_str).unwrap_or_default().trim().to_owned()));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    lines.sort_by_key(|l| l.0);
+    let source = super::browse::find_key(v, "sourceMessage").and_then(Value::as_str).unwrap_or_default();
+    Some(Lyrics { body: LyricsBody::Synced(lines), source: source.trim_start_matches("Source:").trim().to_owned() })
 }
 
 const LRCLIB: &str = "https://lrclib.net/api";
@@ -407,6 +426,19 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(to_lyrics(rec, false).unwrap().body, LyricsBody::Plain(vec!["a".into(), "b".into()]));
+    }
+
+    #[test]
+    fn timed_lyrics_need_every_time() {
+        let timed = serde_json::json!({ "a": { "timedLyricsData": [
+            { "lyricLine": "two", "cueRange": { "startTimeMilliseconds": "900" } },
+            { "lyricLine": "one", "cueRange": { "startTimeMilliseconds": "100" } },
+        ], "sourceMessage": "Source: LyricFind" } });
+        let l = parse_timed(&timed).unwrap();
+        assert_eq!(l.source, "LyricFind");
+        assert_eq!(l.body, LyricsBody::Synced(vec![(100, "one".into()), (900, "two".into())]));
+        let untimed = serde_json::json!({ "timedLyricsData": [{ "lyricLine": "one" }] });
+        assert!(parse_timed(&untimed).is_none());
     }
 
     #[test]

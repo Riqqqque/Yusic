@@ -2,7 +2,7 @@ import { ScrollView, ListView, Spinner, ComboBox } from "std-widgets.slint";
 import { Theme, Icons } from "theme.slint";
 import {
     CardData, TrackData, ShelfData, HeaderData, NowData, MenuEntry, SettingsData, Bridge, Toggle, Segmented, Field,
-    Icon, IconButton, PillButton, Seekbar, TrackRow, LinkText, ShelfList, ClampText, Shape,
+    Icon, IconButton, PillButton, Seekbar, TrackRow, LinkText, LinkLine, ShelfList, ClampText, Shape,
 } from "components.slint";
 
 export { Bridge, Theme, Icons, CardData, TrackData, ShelfData, HeaderData, NowData, MenuEntry, SettingsData }
@@ -200,6 +200,41 @@ component SettingsView inherits Rectangle {
                 }
 
                 SettingRow {
+                    title: "Smarter autoplay";
+                    detail: "Learns from what you finish and what you skip: leaves out songs and artists you keep skipping, and steers back to what you like when autoplay drifts. Kept on this PC.";
+                    Toggle {
+                        checked: root.settings.smart-autoplay;
+                        toggled(on) => {
+                            Bridge.setting("smart-autoplay", on ? "1" : "0");
+                        }
+                    }
+                }
+
+                SettingRow {
+                    title: "Always shuffle";
+                    detail: "Shuffles albums, playlists and artists whenever you play them. Tap shuffle in the player to switch back to the original order.";
+                    Toggle {
+                        checked: root.settings.always-shuffle;
+                        toggled(on) => {
+                            Bridge.setting("always-shuffle", on ? "1" : "0");
+                        }
+                    }
+                }
+
+                SettingRow {
+                    title: "Songs on an artist's page";
+                    detail: "What plays after a song you start from an artist's page.";
+                    Segmented {
+                        labels: ["Their songs, shuffled", "In order", "Radio"];
+                        values: ["shuffle", "order", "radio"];
+                        value: root.settings.artist-play;
+                        picked(v) => {
+                            Bridge.setting("artist-play", v);
+                        }
+                    }
+                }
+
+                SettingRow {
                     title: "Prepare the next song";
                     detail: "Downloads the next song in advance so skipping is instant.";
                     Toggle {
@@ -379,6 +414,17 @@ component SettingsView inherits Rectangle {
                             } else {
                                 Bridge.sign-in();
                             }
+                        }
+                    }
+                }
+
+                SettingRow {
+                    title: "Remembered Google accounts";
+                    detail: "The sign-in window remembers your Google account, so signing in again is one click. Forget them on a shared PC.";
+                    PillButton {
+                        text: "Forget";
+                        clicked => {
+                            Bridge.forget-accounts();
                         }
                     }
                 }
@@ -674,8 +720,29 @@ component LyricsView inherits Rectangle {
     in property <bool> synced;
     in property <string> source;
     property <length> target;
+    // Scrolled by hand: following pauses for a few seconds so the view
+    // doesn't jump away from what's being read.
+    property <bool> manual;
+    property <bool> scrolled-again;
+    Timer {
+        interval: 4s;
+        running: root.manual;
+        triggered => {
+            if root.scrolled-again {
+                root.scrolled-again = false;
+            } else {
+                root.manual = false;
+                root.follow(root.target);
+            }
+        }
+    }
+
     fl := Flickable {
         content-height: col.preferred-height;
+        flicked => {
+            root.scrolled-again = root.manual;
+            root.manual = true;
+        }
         animate content-y {
             duration: 350ms;
             easing: ease-out;
@@ -696,8 +763,11 @@ component LyricsView inherits Rectangle {
                     wrap: word-wrap;
                     font-size: root.font-size;
                     font-weight: 700;
-                    color: !root.synced ? Theme.text : self.is-active-line ? Theme.text : (i < root.active ? Theme.text3 : Theme.text2);
+                    color: !root.synced ? Theme.text : self.is-active-line ? Theme.accent.mix(#ffffff, 0.7) : (i < root.active ? Theme.text3 : Theme.text2);
                     property <bool> is-active-line: parent.is-active;
+                    animate color {
+                        duration: 120ms;
+                    }
                 }
 
                 // Follow the current line, also when the view is (re)created
@@ -720,6 +790,7 @@ component LyricsView inherits Rectangle {
                 if root.synced: TouchArea {
                     mouse-cursor: pointer;
                     clicked => {
+                        root.manual = false;
                         Bridge.lyric-clicked(i);
                     }
                 }
@@ -732,11 +803,18 @@ component LyricsView inherits Rectangle {
         }
     }
 
-    // Keep the current line a third of the way down the panel. Always
-    // scrolls, even to the same line, so a manual scroll snaps back.
+    // Keep the current line a third of the way down the panel.
     function follow(y: length) {
         root.target = y;
-        fl.content-y = -max(0px, min(y - fl.height * 0.33, col.preferred-height - fl.height));
+        if !root.manual {
+            fl.content-y = -max(0px, min(y - fl.height * 0.33, col.preferred-height - fl.height));
+        }
+    }
+    // Before the first line (a new song, or a seek back to the start).
+    changed active => {
+        if root.active < 0 {
+            root.follow(0px);
+        }
     }
     changed height => {
         if root.synced && root.active >= 0 {
@@ -971,7 +1049,10 @@ component PlayerBar inherits Rectangle {
 
                 HorizontalLayout {
                     spacing: 0;
-                    LinkText {
+                    if root.now.artist-links.length > 1: LinkLine {
+                        segs: root.now.artist-links;
+                    }
+                    if root.now.artist-links.length <= 1: LinkText {
                         text: root.now.artists;
                         font-size: 14px;
                         overflow: elide;

@@ -101,6 +101,9 @@ impl App {
             accent: s.accent.as_str().into(),
             region: region_name(&s.region).into(),
             auto_update: s.auto_update,
+            artist_play: s.artist_play.as_str().into(),
+            always_shuffle: s.always_shuffle,
+            smart_autoplay: s.smart_autoplay,
             version: env!("CARGO_PKG_VERSION").into(),
             installed: crate::install::is_installed_copy(),
         }
@@ -138,6 +141,9 @@ impl App {
                 "accent" => s.accent = value.into(),
                 "region" => s.region = region_code(value).into(),
                 "auto-update" => s.auto_update = on,
+                "artist-play" => s.artist_play = value.into(),
+                "always-shuffle" => s.always_shuffle = on,
+                "smart-autoplay" => s.smart_autoplay = on,
                 _ => return,
             }
         }
@@ -254,6 +260,10 @@ impl App {
                     // Liked music changed.
                     app.st.borrow_mut().page_cache.retain(|c| c.0 != Route::Playlist("LM".into()));
                     if rating == Rating::Dislike && still_current {
+                        let item = app.st.borrow().current().cloned();
+                        if let Some(item) = item {
+                            app.note_skipped(&item, 2);
+                        }
                         app.toast("Disliked. Skipping.");
                         app.skip();
                     }
@@ -466,9 +476,11 @@ impl App {
                     let action = action.to_owned();
                     let req = self.st.borrow().play_req;
                     let whole = matches!(action.as_str(), "play-next" | "add-queue");
+                    let artist_mode = self.settings.borrow().artist_play.clone();
+                    let artist_songs = artist_mode != "radio";
                     self.spawn(
                         async move {
-                            let mut p = yt.playable(kind, &id).await.map_err(|e| format!("{e:#}"))?;
+                            let mut p = yt.playable(kind, &id, artist_songs).await.map_err(|e| format!("{e:#}"))?;
                             // Queueing a playlist adds all of it.
                             if whole {
                                 if let Some(more) = p.more.take() {
@@ -481,9 +493,9 @@ impl App {
                         move |app, r| match r {
                             Ok(p) if !p.items.is_empty() => match action.as_str() {
                                 "play" | "shuffle" if app.st.borrow().play_req == req => {
-                                    let start = if action == "shuffle" {
-                                        app.st.borrow_mut().shuffle = true;
-                                        app.ui().set_shuffle(true);
+                                    let shuffle = action == "shuffle" || app.wants_shuffle(kind == Kind::Artist && artist_mode == "shuffle");
+                                    let start = if shuffle {
+                                        app.set_shuffle_state(true);
                                         (app.rand() as usize) % p.items.len()
                                     } else {
                                         0
@@ -527,6 +539,14 @@ impl App {
         {
             let mut st = self.st.borrow_mut();
             let at = if next { (st.qi + 1).min(st.queue.len()) } else { st.queue.len() };
+            // The original (unshuffled) order gets them in the same place.
+            let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+            let cur = st.current().map(|c| c.id.clone());
+            let oat = match (next, cur) {
+                (true, Some(c)) => st.queue_orig.iter().position(|o| *o == c).map_or(st.queue_orig.len(), |p| p + 1),
+                _ => st.queue_orig.len(),
+            };
+            st.queue_orig.splice(oat..oat, ids);
             st.queue.splice(at..at, items);
         }
         self.refresh_queue();

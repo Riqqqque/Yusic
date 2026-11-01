@@ -163,6 +163,8 @@ pub enum Continuation {
     Tracks(rustypipe::model::paginator::Paginator<rustypipe::model::TrackItem>),
     /// More rows of a playlist read with our own InnerTube parser.
     PlaylistRows(String),
+    /// A whole playlist still to load (an artist's full song list).
+    Playlist(String),
 }
 
 /// What the signed-in user can do with the page's subject.
@@ -186,6 +188,8 @@ pub struct Page {
     pub play: Vec<Item>,
     /// Radio playlist id for the header's radio button.
     pub radio: Option<String>,
+    /// An artist's full song list (playlist id), behind their top songs.
+    pub songs_playlist: Option<String>,
     pub notice: String,
     pub actions: PageActions,
 }

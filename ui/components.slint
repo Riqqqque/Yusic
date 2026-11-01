@@ -1,5 +1,13 @@
 import { Theme, Icons } from "theme.slint";
 
+// A piece of a text line; artist and album names carry their id.
+export struct LinkSeg {
+    text: string,
+    // "artist" | "album" ("" for plain text)
+    kind: string,
+    id: string,
+}
+
 export struct CardData {
     kind: string,
     id: string,
@@ -9,6 +17,9 @@ export struct CardData {
     image: image,
     round: bool,
     wide: bool,
+    // The subtitle as two lines with clickable names (empty: no links).
+    line1: [LinkSeg],
+    line2: [LinkSeg],
 }
 
 export struct TrackData {
@@ -23,6 +34,9 @@ export struct TrackData {
     active: bool,
     artist-id: string,
     album-id: string,
+    // The subtitle and the artist column with clickable names.
+    subtitle-links: [LinkSeg],
+    artist-links: [LinkSeg],
 }
 
 export struct ShelfData {
@@ -61,6 +75,7 @@ export struct NowData {
     art: image,
     artist-id: string,
     album-id: string,
+    artist-links: [LinkSeg],
     // 0 none, 1 liked, 2 disliked
     rating: int,
 }
@@ -85,6 +100,10 @@ export struct SettingsData {
     accent: string,
     region: string,
     auto-update: bool,
+    // After a song from an artist's page: "shuffle" | "order" | "radio"
+    artist-play: string,
+    always-shuffle: bool,
+    smart-autoplay: bool,
     version: string,
     installed: bool,
 }
@@ -117,6 +136,7 @@ export global Bridge {
     callback cycle-repeat();
     callback sign-in();
     callback sign-out();
+    callback forget-accounts();
     callback account();
     callback toggle-mute();
     callback np-changed();
@@ -362,6 +382,90 @@ export component ClampText inherits Rectangle {
     }
 }
 
+export component LinkText inherits Text {
+    callback clicked;
+    in property <bool> link: true;
+    color: lta.has-hover && link ? Theme.text : Theme.text2;
+    lta := TouchArea {
+        // Plain text lets clicks through to the row or card underneath.
+        enabled: root.link;
+        mouse-cursor: root.link ? pointer : default;
+        clicked => {
+            if root.link {
+                root.clicked();
+            }
+        }
+    }
+}
+
+// A line of text whose artist and album names open their pages. When the
+// whole line doesn't fit, it shows shortened as one text that opens the first
+// name instead (pieces can't share one "..." between them).
+export component LinkLine inherits Rectangle {
+    in property <[LinkSeg]> segs;
+    in property <length> font-size: 14px;
+    property <string> full: segs[0].text + segs[1].text + segs[2].text + segs[3].text + segs[4].text + segs[5].text + segs[6].text + segs[7].text + segs[8].text + segs[9].text + segs[10].text + segs[11].text;
+    property <LinkSeg> first: segs[0].id != "" ? segs[0] : segs[1].id != "" ? segs[1] : segs[2];
+    property <bool> fits: root.width >= measure.preferred-width;
+    min-width: 0px;
+    preferred-width: measure.preferred-width;
+    min-height: measure.preferred-height;
+    preferred-height: measure.preferred-height;
+    // Sized to nothing so it never widens the line; only its preferred
+    // width (the whole text) is read.
+    measure := HorizontalLayout {
+        x: 0;
+        y: 0;
+        width: 0px;
+        height: 0px;
+        visible: false;
+        for s in root.segs: Text {
+            text: s.text;
+            font-size: root.font-size;
+        }
+    }
+
+    if root.fits: HorizontalLayout {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        alignment: start;
+        spacing: 0;
+        for s in root.segs: LinkText {
+            text: s.text;
+            font-size: root.font-size;
+            vertical-alignment: center;
+            link: s.id != "";
+            clicked => {
+                if s.kind == "album" {
+                    Bridge.album-clicked(s.id);
+                } else {
+                    Bridge.artist-clicked(s.id);
+                }
+            }
+        }
+    }
+    if !root.fits: LinkText {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        text: root.full;
+        font-size: root.font-size;
+        overflow: elide;
+        vertical-alignment: center;
+        link: root.first.id != "";
+        clicked => {
+            if root.first.kind == "album" {
+                Bridge.album-clicked(root.first.id);
+            } else {
+                Bridge.artist-clicked(root.first.id);
+            }
+        }
+    }
+}
+
 export component Card inherits Rectangle {
     in property <CardData> data;
     in property <length> size: Theme.card;
@@ -404,27 +508,6 @@ export component Card inherits Rectangle {
         }
     }
 
-    VerticalLayout {
-        x: 0;
-        y: root.size + 10px;
-        width: root.art-w;
-        height: 82px;
-        alignment: start;
-        spacing: 2px;
-        ClampText {
-            text: root.data.title;
-            font-size: 15px;
-            font-weight: 600;
-            align: root.data.round ? center : left;
-        }
-
-        ClampText {
-            text: root.data.subtitle;
-            tint: Theme.text2;
-            align: root.data.round ? center : left;
-        }
-    }
-
     ta := TouchArea {
         mouse-cursor: pointer;
         clicked => {
@@ -440,6 +523,34 @@ export component Card inherits Rectangle {
             }
         }
     }
+
+    VerticalLayout {
+        x: 0;
+        y: root.size + 10px;
+        width: root.art-w;
+        height: 82px;
+        alignment: start;
+        spacing: 2px;
+        ClampText {
+            text: root.data.title;
+            font-size: 15px;
+            font-weight: 600;
+            align: root.data.round ? center : left;
+        }
+
+        if root.data.line1.length == 0: ClampText {
+            text: root.data.subtitle;
+            tint: Theme.text2;
+            align: root.data.round ? center : left;
+        }
+        if root.data.line1.length > 0: LinkLine {
+            segs: root.data.line1;
+        }
+        if root.data.line2.length > 0: LinkLine {
+            segs: root.data.line2;
+        }
+    }
+
 }
 
 component Thumb inherits Rectangle {
@@ -463,20 +574,6 @@ component Thumb inherits Rectangle {
         Icon {
             path: root.active && !root.hover ? Icons.radio : Icons.play;
             size: 24px;
-        }
-    }
-}
-
-export component LinkText inherits Text {
-    callback clicked;
-    in property <bool> link: true;
-    color: lta.has-hover && link ? Theme.text : Theme.text2;
-    lta := TouchArea {
-        mouse-cursor: root.link ? pointer : default;
-        clicked => {
-            if root.link {
-                root.clicked();
-            }
         }
     }
 }
@@ -556,7 +653,10 @@ export component TrackRow inherits Rectangle {
                     overflow: elide;
                 }
 
-                Text {
+                if root.data.subtitle-links.length > 0: LinkLine {
+                    segs: root.data.subtitle-links;
+                }
+                if root.data.subtitle-links.length == 0: Text {
                     text: root.data.subtitle;
                     color: Theme.text2;
                     font-size: 14px;
@@ -574,7 +674,14 @@ export component TrackRow inherits Rectangle {
                 overflow: elide;
                 vertical-alignment: center;
             }
-            if root.columns && root.data.artists != "": LinkText {
+            if root.columns && root.data.artist-links.length > 1: LinkLine {
+                horizontal-stretch: 2;
+                min-width: 0px;
+                preferred-width: 0;
+                segs: root.data.artist-links;
+                font-size: 15px;
+            }
+            if root.columns && root.data.artists != "" && root.data.artist-links.length <= 1: LinkText {
                 horizontal-stretch: 2;
                 min-width: 0px;
                 preferred-width: 0;

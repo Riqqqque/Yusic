@@ -12,6 +12,7 @@ mod player;
 mod resolver;
 mod settings;
 mod single;
+mod taste;
 mod tools;
 mod tray;
 mod win;
@@ -90,7 +91,25 @@ fn data_dir() -> PathBuf {
         .join("Yusic")
 }
 
+/// Keeps a record of panics; a windowed app has no console to show them on.
+fn log_panics() {
+    let dir = data_dir();
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write;
+        let path = dir.join("crash.log");
+        // One file, kept small.
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > 64 * 1024) {
+            let _ = std::fs::remove_file(&path);
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(f, "{} {info}", env!("CARGO_PKG_VERSION"));
+        }
+        eprintln!("{info}");
+    }));
+}
+
 fn main() {
+    log_panics();
     if let Err(e) = run() {
         win::error_box(&format!("{e:#}"));
     }
@@ -163,8 +182,6 @@ fn run() -> Result<()> {
 
     let res = Arc::new(Resolver::new(tools::find(&dir), &dir, http.clone())?);
     let yt = Arc::new(Yt::new(&dir, http.clone())?);
-    // A sign-in window from a previous run may have left its browser profile.
-    login::clear_profile(&dir);
 
     let ui = AppWindow::new()?;
     images::init(http.clone(), rt.handle().clone());
@@ -280,17 +297,15 @@ fn run() -> Result<()> {
 
     app.remember_window();
     app.shutdown();
-    // Give a closed sign-in window's browser processes a moment to exit.
-    for _ in 0..10 {
-        if !login::profile_dir(&dir).exists() {
-            break;
-        }
-        login::clear_profile(&dir);
-        std::thread::sleep(Duration::from_millis(200));
-    }
     drop(tray);
     drop(update_watch);
     rt.shutdown_timeout(Duration::from_millis(300));
+    // Everything is saved. Windows' media components fault while they're torn
+    // down at a normal exit, so end here without running that teardown.
+    unsafe {
+        use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+        let _ = TerminateProcess(GetCurrentProcess(), 0);
+    }
     Ok(())
 }
 

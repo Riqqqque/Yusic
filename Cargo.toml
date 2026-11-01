@@ -1,6 +1,6 @@
 [package]
 name = "yusic"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 authors = ["Rique"]
 description = "Lightweight native YouTube Music client for Windows"
@@ -54,7 +54,8 @@ winresource = "0.1.31"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# Unwind, so a panic in a library on a background task ends that task
+# instead of closing the app.
 strip = true
 
 [profile.dev.package."*"]

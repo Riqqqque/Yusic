@@ -1,6 +1,7 @@
-//! Google sign-in in a temporary WebView2 window. Once YouTube Music loads
-//! signed in, its cookies are handed back and the webview is destroyed, so
-//! no browser processes stay around during normal use.
+//! Google sign-in in a WebView2 window. Once YouTube Music loads signed in,
+//! its cookies are handed back and the webview is destroyed, so no browser
+//! processes stay around during normal use. The window's profile is kept, so
+//! signing in again is one click on the account in Google's account chooser.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -22,7 +23,9 @@ slint::slint! {
     }
 }
 
-const LOGIN_URL: &str = "https://accounts.google.com/ServiceLogin?ltmpl=music&service=youtube&passive=true&continue=https%3A%2F%2Fwww.youtube.com%2Fsignin%3Faction_handle_signin%3Dtrue%26app%3Ddesktop%26next%3Dhttps%253A%252F%252Fmusic.youtube.com%252F";
+// The account chooser: remembered accounts are one click; otherwise it asks
+// for the email as usual.
+const LOGIN_URL: &str = "https://accounts.google.com/AccountChooser?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2Fsignin%3Faction_handle_signin%3Dtrue%26app%3Ddesktop%26next%3Dhttps%253A%252F%252Fmusic.youtube.com%252F";
 
 type OnCookie = Box<dyn FnOnce(String)>;
 
@@ -45,8 +48,7 @@ pub fn profile_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("WebView2")
 }
 
-/// Deletes the sign-in browser profile. It only holds a session we have
-/// already copied, and keeping it would leave a second live login on disk.
+/// Deletes the sign-in browser profile (the remembered Google accounts).
 pub fn clear_profile(data_dir: &Path) {
     let _ = std::fs::remove_dir_all(profile_dir(data_dir));
 }
