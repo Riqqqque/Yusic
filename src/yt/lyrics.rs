@@ -70,6 +70,7 @@ pub fn parse_timed(v: &serde_json::Value) -> Option<Lyrics> {
 }
 
 const LRCLIB: &str = "https://lrclib.net/api";
+pub const LRCLIB_SOURCE: &str = "LRCLIB";
 
 /// A (title, artist) pair to search for.
 struct Query {
@@ -95,7 +96,12 @@ pub async fn lrclib(http: &reqwest::Client, t: &TrackInfo<'_>) -> Result<Option<
     if resp.status().is_success() {
         let rec: LrcRecord = resp.json().await.unwrap_or_default();
         if rec.has_lyrics() {
-            return Ok(to_lyrics(rec, true));
+            // Timed for this length, or nothing to check it against.
+            let fits = match (rec.duration, t.duration) {
+                (Some(a), Some(b)) => (a - b as f64).abs() <= 3.0,
+                _ => true,
+            };
+            return Ok(to_lyrics(rec, fits));
         }
     } else if resp.status() != reqwest::StatusCode::NOT_FOUND {
         anyhow::bail!("LRCLIB returned HTTP {}", resp.status());
@@ -182,7 +188,7 @@ fn pick(recs: Vec<LrcRecord>, title: &str, t: &TrackInfo<'_>) -> Option<(LrcReco
 }
 
 fn to_lyrics(r: LrcRecord, trust_timing: bool) -> Option<Lyrics> {
-    let source = "LRCLIB".to_string();
+    let source = LRCLIB_SOURCE.to_string();
     if r.instrumental {
         return Some(Lyrics { body: LyricsBody::Instrumental, source });
     }
@@ -205,6 +211,226 @@ pub fn plain_lines(text: &str) -> Vec<String> {
 }
 
 /// Parses `[mm:ss.xx] text` lines (several timestamps per line allowed).
+/// Reads a WebVTT caption file into (start in ms, text), without timing tags
+/// or notes like [Music]. YouTube's speech captions repeat each line as they
+/// scroll, so only a cue's last line counts, once.
+pub fn parse_vtt(text: &str) -> Vec<(u32, String)> {
+    let mut out: Vec<(u32, String)> = Vec::new();
+    for block in text.replace("\r\n", "\n").split("\n\n") {
+        let mut rows = block.lines();
+        let Some(head) = rows.find(|l| l.contains(" --> ")) else { continue };
+        let Some(ms) = head.split_whitespace().next().and_then(vtt_time) else { continue };
+        let Some(line) = rows.map(clean_caption).filter(|l| !l.is_empty()).last() else { continue };
+        if out.last().is_none_or(|l| l.1 != line) {
+            out.push((ms, line));
+        }
+    }
+    out
+}
+
+fn vtt_time(s: &str) -> Option<u32> {
+    let (rest, frac) = s.split_once('.')?;
+    let mut secs = 0u32;
+    for part in rest.split(':') {
+        secs = secs * 60 + part.parse::<u32>().ok()?;
+    }
+    Some(secs * 1000 + frac.parse::<u32>().ok()?)
+}
+
+fn clean_caption(line: &str) -> String {
+    let mut out = String::new();
+    let mut close = None;
+    for c in line.chars() {
+        match (close, c) {
+            (None, '<') => close = Some('>'),
+            (None, '[') => close = Some(']'),
+            (None, _) => out.push(c),
+            (Some(end), _) if c == end => close = None,
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Words for comparing lyrics with speech captions, which rarely agree on
+/// accents.
+fn plain_words(s: &str) -> Vec<String> {
+    norm(s)
+        .chars()
+        .map(|c| match c {
+            '\u{e1}' | '\u{e0}' | '\u{e4}' | '\u{e2}' => 'a',
+            '\u{e9}' | '\u{e8}' | '\u{eb}' | '\u{ea}' => 'e',
+            '\u{ed}' | '\u{ec}' | '\u{ef}' | '\u{ee}' => 'i',
+            '\u{f3}' | '\u{f2}' | '\u{f6}' | '\u{f4}' => 'o',
+            '\u{fa}' | '\u{f9}' | '\u{fc}' | '\u{fb}' => 'u',
+            '\u{f1}' => 'n',
+            c => c,
+        })
+        .collect::<String>()
+        .split(' ')
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Checks timed lyrics against speech captions of the recording. Community
+/// lyrics are sometimes only partly right; stretches of at least three lines
+/// that aren't being sung around their time are replaced with the captions.
+/// None when they agree, or when the captions don't look like this recording
+/// (too little in common), so unrelated captions can't touch good lyrics.
+pub fn repair_with_captions(lines: &[(u32, String)], caps: &[(u32, String)]) -> Option<Vec<(u32, String)>> {
+    const BEFORE_MS: u32 = 8_000;
+    const AFTER_MS: u32 = 12_000;
+    let heard: Vec<(u32, Vec<String>)> = caps.iter().map(|(t, l)| (*t, plain_words(l))).collect();
+    // Some(true): being sung then. None: too short to judge.
+    let verdicts: Vec<Option<bool>> = lines
+        .iter()
+        .map(|(t, line)| {
+            let words = plain_words(line);
+            if words.len() < 3 {
+                return None;
+            }
+            let near: Vec<&String> = heard
+                .iter()
+                .filter(|(c, _)| *c + BEFORE_MS >= *t && *c <= t + AFTER_MS)
+                .flat_map(|(_, w)| w)
+                .collect();
+            let found = words.iter().filter(|w| near.contains(w)).count();
+            Some(found * 2 >= words.len())
+        })
+        .collect();
+    let judged = verdicts.iter().flatten().count();
+    let good = verdicts.iter().flatten().filter(|v| **v).count();
+    if judged < 6 || good * 10 < judged * 3 {
+        return None;
+    }
+    // The stretches of wrong lines, as (first line, line after).
+    let mut wrong = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if verdicts[i] != Some(false) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut bad = 0;
+        while i < lines.len() && verdicts[i] != Some(true) {
+            bad += (verdicts[i] == Some(false)) as usize;
+            i += 1;
+        }
+        if bad >= 3 {
+            wrong.push((start, i));
+        }
+    }
+    if wrong.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut next = 0;
+    for (start, end) in wrong {
+        out.extend_from_slice(&lines[next..start]);
+        let from = lines[start].0.saturating_sub(2_000);
+        let to = lines.get(end).map_or(u32::MAX, |l| l.0);
+        out.extend(caption_lines(caps.iter().filter(|(t, _)| *t >= from && *t < to)));
+        next = end;
+    }
+    out.extend_from_slice(&lines[next..]);
+    Some(out)
+}
+
+/// Note shown with lyrics whose timing is for another version of the song.
+pub const UNTIMED_NOTE: &str = "not timed for this version";
+
+/// Timed lyrics that run past the end of the track belong to a longer
+/// version (a live or edited cut): keep the words, drop the timing.
+pub fn fit_to_track(l: Lyrics, track_secs: Option<u32>) -> Lyrics {
+    const SLACK_MS: u32 = 2_000;
+    let LyricsBody::Synced(lines) = &l.body else { return l };
+    let Some(secs) = track_secs else { return l };
+    let last = lines.iter().rev().find(|x| !x.1.trim().is_empty()).map_or(0, |x| x.0);
+    if last <= secs * 1000 + SLACK_MS {
+        return l;
+    }
+    let words = lines.iter().map(|x| x.1.clone()).collect();
+    Lyrics { body: LyricsBody::Plain(words), source: format!("{} ({UNTIMED_NOTE})", l.source) }
+}
+
+/// For diagnosis: (lines judged, lines heard) of timed lyrics against captions.
+pub fn caption_agreement(lines: &[(u32, String)], caps: &[(u32, String)]) -> (usize, usize) {
+    let heard: Vec<(u32, Vec<String>)> = caps.iter().map(|(t, l)| (*t, plain_words(l))).collect();
+    let mut judged = 0;
+    let mut good = 0;
+    for (t, line) in lines {
+        let words = plain_words(line);
+        if words.len() < 3 {
+            continue;
+        }
+        judged += 1;
+        let near: Vec<&String> = heard.iter().filter(|(c, _)| *c + 8_000 >= *t && *c <= t + 12_000).flat_map(|(_, w)| w).collect();
+        good += (words.iter().filter(|w| near.contains(w)).count() * 2 >= words.len()) as usize;
+    }
+    (judged, good)
+}
+
+/// Captions tidied into lyric lines. Captions wrap wherever they run out of
+/// room, so punctuated ones are re-split at their punctuation (word times are
+/// spread over each caption); others keep their breaks, with single stray
+/// words joining the line before.
+fn caption_lines<'a>(caps: impl Iterator<Item = &'a (u32, String)>) -> Vec<(u32, String)> {
+    const MAX_WORDS: usize = 9;
+    const MAX_SPREAD_MS: u32 = 4_000;
+    let caps: Vec<&(u32, String)> = caps.collect();
+    let ends_phrase = |w: &str| w.ends_with([',', '.', ';', '?', '!']);
+    let mut rows: Vec<(u32, String)> = Vec::new();
+    if caps.iter().any(|c| c.1.split(' ').any(ends_phrase)) {
+        let (mut start, mut words) = (0, Vec::new());
+        for (i, (t, text)) in caps.iter().map(|c| (c.0, &c.1)).enumerate() {
+            let span = caps.get(i + 1).map_or(MAX_SPREAD_MS, |n| n.0.saturating_sub(t)).min(MAX_SPREAD_MS);
+            let count = text.split(' ').count() as u32;
+            for (k, w) in text.split(' ').enumerate() {
+                if words.is_empty() {
+                    start = t + span * k as u32 / count;
+                }
+                words.push(w);
+                if ends_phrase(w) || words.len() >= MAX_WORDS {
+                    rows.push((start, words.join(" ")));
+                    words.clear();
+                }
+            }
+        }
+        if !words.is_empty() {
+            rows.push((start, words.join(" ")));
+        }
+    } else {
+        for (t, text) in caps.iter().map(|c| (c.0, &c.1)) {
+            match rows.last_mut() {
+                Some(last) if !text.contains(' ') && t.saturating_sub(last.0) < 5_000 => {
+                    last.1.push(' ');
+                    last.1.push_str(text);
+                }
+                _ => rows.push((t, text.clone())),
+            }
+        }
+    }
+    rows.into_iter()
+        .map(|(t, line)| {
+            let line = line.trim_end_matches([',', '.', ';']);
+            let mut c = line.chars();
+            let first = c.next().map(|f| f.to_uppercase().collect::<String>()).unwrap_or_default();
+            (t, first + c.as_str())
+        })
+        .filter(|l| !l.1.is_empty())
+        .collect()
+}
+
+/// A search result that can stand in for the track when it has no captions:
+/// the same song by the same artist, at about the same length.
+pub fn matches_track(found: &str, title: &str, artist: &str, secs: Option<u32>, length: Option<u32>) -> bool {
+    const SLACK_SECS: u32 = 8;
+    let found = format!(" {} ", norm(found));
+    let close = matches!((secs, length), (Some(a), Some(b)) if a.abs_diff(b) <= SLACK_SECS);
+    close && found.contains(&format!(" {} ", norm(&clean_title(title, artist)))) && found.contains(&format!(" {} ", norm(artist)))
+}
+
 pub fn parse_lrc(text: &str) -> Vec<(u32, String)> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -426,6 +652,65 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(to_lyrics(rec, false).unwrap().body, LyricsBody::Plain(vec!["a".into(), "b".into()]));
+    }
+
+    fn timed(rows: &[(u32, &str)]) -> Vec<(u32, String)> {
+        rows.iter().map(|(t, l)| (*t * 1000, l.to_string())).collect()
+    }
+
+    #[test]
+    fn reads_rolling_captions() {
+        let vtt = "WEBVTT\n\n00:00:01.500 --> 00:00:03.000 align:start\n \none<00:00:02.000><c> two</c> [Music]\n\n00:00:03.000 --> 00:00:03.010\none two\n\n00:01:05.250 --> 00:01:07.000\none two\nthree four\n";
+        assert_eq!(parse_vtt(vtt), vec![(1500, "one two".into()), (65_250, "three four".into())]);
+    }
+
+    #[test]
+    fn keeps_lyrics_the_captions_agree_with() {
+        let lyrics = timed(&[(10, "red green blue"), (20, "cat dog bird"), (30, "sun moon star"), (40, "fish frog crab"), (50, "oak elm ash"), (60, "tin zinc iron")]);
+        assert_eq!(repair_with_captions(&lyrics, &lyrics), None);
+    }
+
+    #[test]
+    fn replaces_only_the_wrong_stretch() {
+        let lyrics = timed(&[(10, "red green blue"), (30, "cat dog bird"), (50, "sun moon star"), (70, "wrong words here"), (90, "not sung at all"), (110, "more made up text"), (130, "the very last line")]);
+        let caps = timed(&[(10, "red green blue"), (30, "cat dog bird"), (50, "sun moon star"), (70, "the real verse"), (90, "goes like this")]);
+        let fixed = repair_with_captions(&lyrics, &caps).unwrap();
+        let text: Vec<&str> = fixed.iter().map(|l| l.1.as_str()).collect();
+        assert_eq!(text, ["red green blue", "cat dog bird", "sun moon star", "The real verse", "Goes like this"]);
+    }
+
+    #[test]
+    fn splits_captions_at_their_punctuation() {
+        let caps = timed(&[(10, "the first phrase, and the"), (14, "second one. Then a third")]);
+        let got = caption_lines(caps.iter());
+        let text: Vec<&str> = got.iter().map(|l| l.1.as_str()).collect();
+        assert_eq!(text, ["The first phrase", "And the second one", "Then a third"]);
+        assert_eq!(got[0].0, 10_000);
+        assert!(got[1].0 > 10_000 && got[1].0 < 14_000);
+    }
+
+    #[test]
+    fn ignores_captions_of_something_else() {
+        let lyrics = timed(&[(10, "red green blue"), (20, "cat dog bird"), (30, "sun moon star"), (40, "fish frog crab"), (50, "oak elm ash"), (60, "tin zinc iron")]);
+        let caps = timed(&[(10, "nothing in common"), (30, "with those lines"), (50, "at any point")]);
+        assert_eq!(repair_with_captions(&lyrics, &caps), None);
+    }
+
+    #[test]
+    fn finds_a_stand_in_video() {
+        assert!(matches_track("Some Artist - Song (Lyrics)", "Song", "Some Artist", Some(203), Some(200)));
+        assert!(!matches_track("Some Artist - Song (Lyrics)", "Song", "Some Artist", Some(240), Some(200)));
+        assert!(!matches_track("Other Band - Song (Lyrics)", "Song", "Some Artist", Some(200), Some(200)));
+    }
+
+    #[test]
+    fn lyrics_longer_than_the_track_lose_their_timing() {
+        let l = Lyrics { body: LyricsBody::Synced(timed(&[(3, "a b c"), (178, "d e f")])), source: "LRCLIB".into() };
+        let fitted = fit_to_track(l.clone(), Some(168));
+        assert!(matches!(fitted.body, LyricsBody::Plain(ref v) if v.len() == 2));
+        assert!(fitted.source.contains(UNTIMED_NOTE));
+        assert!(matches!(fit_to_track(l.clone(), Some(185)).body, LyricsBody::Synced(_)));
+        assert!(matches!(fit_to_track(l, None).body, LyricsBody::Synced(_)));
     }
 
     #[test]

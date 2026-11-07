@@ -2004,9 +2004,17 @@ impl App {
         ui.set_lyrics_synced(false);
         ui.set_lyrics_source("".into());
         let yt = self.yt.clone();
+        let res = self.res.clone();
         let vid = id.clone();
+        let item = self.st.borrow().current().cloned();
         self.spawn(
-            async move { yt.lyrics(&vid).await.map_err(|e| format!("{e:#}")) },
+            async move {
+                let l = yt.lyrics(&vid).await.map_err(|e| format!("{e:#}"))?;
+                Ok::<_, String>(match l {
+                    Some(l) => Some(verified_lyrics(&yt, &res, &vid, item, l).await),
+                    None => None,
+                })
+            },
             move |app, r| {
                 if app.st.borrow().lyrics_for.as_deref() != Some(id.as_str()) {
                     return;
@@ -2437,6 +2445,45 @@ fn split_lines(segs: Vec<LinkSeg>, budget: usize) -> (Vec<LinkSeg>, Vec<LinkSeg>
     (l1, l2)
 }
 
+/// Community lyrics are checked against what's actually sung: YouTube's speech
+/// captions of this recording, or of a lyric video of it when it has none.
+/// YouTube's own timed lyrics don't need this.
+async fn verified_lyrics(yt: &Yt, res: &Resolver, id: &str, item: Option<Item>, l: lyrics::Lyrics) -> lyrics::Lyrics {
+    const CHECK_TIME: Duration = Duration::from_secs(25);
+    if !matches!(l.body, LyricsBody::Synced(_)) || l.source != lyrics::LRCLIB_SOURCE {
+        return l;
+    }
+    // A queue entry can be just an id until its details arrive.
+    let item = match item.filter(|i| i.duration.is_some() && !i.artists.is_empty()) {
+        Some(i) => i,
+        None => match yt.track(id).await {
+            Ok(i) => i,
+            Err(_) => return l,
+        },
+    };
+    // Timing written for a longer version can't fit this one.
+    let l = lyrics::fit_to_track(l, item.duration);
+    let LyricsBody::Synced(lines) = &l.body else { return l };
+    let check = async {
+        let artist = item.artists.first().map(|a| a.name.as_str()).unwrap_or_default();
+        let mut vtt = res.captions(id).await;
+        if vtt.is_none() {
+            let found = res.search_videos(&format!("{artist} {} lyrics", item.title)).await;
+            let stand_in = found
+                .iter()
+                .find(|(v, title, secs)| v != id && lyrics::matches_track(title, &item.title, artist, *secs, item.duration));
+            if let Some((v, ..)) = stand_in {
+                vtt = res.captions(v).await;
+            }
+        }
+        lyrics::repair_with_captions(lines, &lyrics::parse_vtt(&vtt?))
+    };
+    match tokio::time::timeout(CHECK_TIME, check).await {
+        Ok(Some(fixed)) => lyrics::Lyrics { body: LyricsBody::Synced(fixed), source: format!("{}, corrected from YouTube captions", l.source) },
+        _ => l,
+    }
+}
+
 fn seg_model(v: Vec<LinkSeg>) -> ModelRc<LinkSeg> {
     if v.is_empty() { ModelRc::default() } else { ModelRc::new(VecModel::from(v)) }
 }
@@ -2585,5 +2632,104 @@ mod link_tests {
         assert!(a.chars().count() <= 26, "{a}");
         assert!(!b.is_empty());
         assert!(l2.iter().any(|s| s.id == "UC2"));
+    }
+}
+
+#[cfg(test)]
+mod lyric_check_tests {
+    use super::*;
+
+    /// A song whose community lyrics are wrong after the first verse gets
+    /// corrected: `cargo test -- --ignored lyric_check --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn lyric_check_corrects_a_wrong_verse() {
+        let dir = std::env::temp_dir().join(format!("yusic-check-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let http = reqwest::Client::new();
+        let yt = Yt::new(&dir, http.clone()).unwrap();
+        let res = Resolver::new(crate::tools::find(&dir), &dir, http).unwrap();
+        let id = "2C29r956v40";
+        // Only the id, like a queue entry whose details haven't arrived yet.
+        let item = Item { id: id.into(), title: id.into(), ..Default::default() };
+        let l = yt.lyrics(id).await.unwrap().expect("lyrics");
+        if l.source != lyrics::LRCLIB_SOURCE {
+            // YouTube has its own timed lyrics for it now; nothing to correct.
+            println!("now from {}", l.source);
+            return;
+        }
+        let before = match &l.body {
+            LyricsBody::Synced(v) => v.len(),
+            _ => 0,
+        };
+        let t = Instant::now();
+        let fixed = verified_lyrics(&yt, &res, id, Some(item), l).await;
+        println!("{before} lines -> source {:?} after {:?}", fixed.source, t.elapsed());
+        assert!(fixed.source.contains("corrected"));
+        let LyricsBody::Synced(lines) = &fixed.body else { panic!("timed lyrics") };
+        // The real second verse is sung around 1:39, and vocals end near 2:33.
+        let verse = lines.iter().find(|l| l.1.to_lowercase().contains("besos")).expect("the real verse");
+        assert!((95_000..105_000).contains(&verse.0), "{}", verse.0);
+        assert!(lines.last().unwrap().0 < 165_000);
+        assert!(lines.windows(2).all(|w| w[0].0 <= w[1].0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Diagnoses the songs in YUSIC_LYRICS_IDS (comma separated).
+    #[tokio::test]
+    #[ignore]
+    async fn lyric_diagnose() {
+        let dir = std::env::temp_dir().join(format!("yusic-diag-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let http = reqwest::Client::new();
+        let yt = Yt::new(&dir, http.clone()).unwrap();
+        let res = Resolver::new(crate::tools::find(&dir), &dir, http).unwrap();
+        for id in std::env::var("YUSIC_LYRICS_IDS").unwrap_or_default().split(',').filter(|s| !s.is_empty()) {
+            let item = yt.track(id).await.unwrap();
+            println!("== {id} {:?} by {:?} {:?}s", item.title, item.artist_names(), item.duration);
+            let Ok(Some(l)) = yt.lyrics(id).await else { println!("   no lyrics"); continue };
+            let lines = match &l.body { LyricsBody::Synced(v) => v.clone(), LyricsBody::Plain(v) => { println!("   PLAIN {} lines from {}", v.len(), l.source); continue } , _ => Vec::new() };
+            println!("   synced {} lines from {}, first at {}ms, last at {}ms", lines.len(), l.source, lines.first().map_or(0, |x| x.0), lines.last().map_or(0, |x| x.0));
+            let own = res.captions(id).await;
+            println!("   own captions: {}", own.as_ref().map_or("none".into(), |v| format!("{} cues", lyrics::parse_vtt(v).len())));
+            let artist = item.artists.first().map(|a| a.name.clone()).unwrap_or_default();
+            let found = res.search_videos(&format!("{artist} {} lyrics", item.title)).await;
+            for (v, t, s) in &found {
+                let ok = lyrics::matches_track(t, &item.title, &artist, *s, item.duration);
+                println!("   search: {v} {s:?}s match={ok} {t:?}");
+            }
+            let caps_text = match own { Some(v) => Some(v), None => match found.iter().find(|(v, t, s)| v != id && lyrics::matches_track(t, &item.title, &artist, *s, item.duration)) { Some((v, ..)) => res.captions(v).await, None => None } };
+            if let Some(v) = caps_text {
+                let caps = lyrics::parse_vtt(&v);
+                let (judged, good) = lyrics::caption_agreement(&lines, &caps);
+                println!("   captions {} cues; lines judged {judged}, heard {good}; repair: {}", caps.len(), lyrics::repair_with_captions(&lines, &caps).map_or("none".into(), |r| format!("{} lines", r.len())));
+            }
+            let fixed = verified_lyrics(&yt, &res, id, Some(item), l).await;
+            println!("   app result source: {}", fixed.source);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Songs with sound community lyrics come through untouched.
+    #[tokio::test]
+    #[ignore]
+    async fn lyric_check_leaves_good_lyrics_alone() {
+        let dir = std::env::temp_dir().join(format!("yusic-keep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let http = reqwest::Client::new();
+        let yt = Yt::new(&dir, http.clone()).unwrap();
+        let res = Resolver::new(crate::tools::find(&dir), &dir, http).unwrap();
+        let mut changed = 0;
+        for id in ["dQw4w9WgXcQ", "kJQP7kiw5Fk", "JGwWNGJdvx8", "fJ9rUzIMcZQ", "09R8_2nJtjg", "hT_nvWreIhg", "CevxZvSJLk8", "OPf0YbXqDm0"] {
+            let Ok(item) = yt.track(id).await else { continue };
+            let Ok(Some(l)) = yt.lyrics(id).await else { continue };
+            let src = l.source.clone();
+            let n = match &l.body { LyricsBody::Synced(v) => v.len(), _ => 0 };
+            let fixed = verified_lyrics(&yt, &res, id, Some(item.clone()), l).await;
+            println!("{id} {:?}: {src}, {n} lines -> {}", item.title, fixed.source);
+            changed += fixed.source.contains("corrected") as u32;
+        }
+        println!("changed {changed}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

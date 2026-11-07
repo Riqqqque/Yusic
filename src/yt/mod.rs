@@ -622,11 +622,17 @@ impl Yt {
         let details = self.q().music_details(video_id).await.context("could not load track details")?;
         let t = &details.track;
         let artist = t.artists.first().map(|a| a.name.clone()).unwrap_or_default();
+        // Timing can only be matched against a known length; the details
+        // sometimes leave it out.
+        let duration = match t.duration {
+            Some(d) => Some(d),
+            None => self.track(video_id).await.ok().and_then(|i| i.duration),
+        };
         let info = lyrics::TrackInfo {
             title: &t.name,
             artist: &artist,
             album: t.album.as_ref().map(|a| a.name.as_str()),
-            duration: t.duration,
+            duration,
         };
         // Timed for this exact track, so they beat anything matched by name.
         if let Some(id) = &details.lyrics_id {

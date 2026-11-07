@@ -50,6 +50,7 @@ impl Quality {
     }
 }
 const YTDLP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+const CAPTIONS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[derive(Clone, Deserialize)]
 struct Resolved {
@@ -294,6 +295,49 @@ impl Resolver {
         };
         disable_fragmented_edit_list(&path)?;
         Ok(path)
+    }
+
+    /// YouTube's speech captions for a video, as WebVTT text. None if it has none.
+    pub async fn captions(&self, id: &str) -> Option<String> {
+        self.wait_for_tools().await;
+        let _permit = self.procs.acquire().await.ok()?;
+        let dir = self.data_dir.join("captions");
+        std::fs::create_dir_all(&dir).ok()?;
+        let mut cmd = self.command(Quality::Compatible).ok()?;
+        let run = cmd
+            .args(["--ignore-no-formats-error", "--skip-download", "--write-auto-subs", "--sub-langs", ".*-orig", "--sub-format", "vtt", "-o"])
+            .arg(dir.join(format!("{id}.%(ext)s")))
+            .arg(watch_url(id))
+            .output();
+        let _ = tokio::time::timeout(CAPTIONS_TIMEOUT, run).await;
+        let mut text = None;
+        for e in std::fs::read_dir(&dir).ok()?.flatten() {
+            if text.is_none() && e.file_name().to_string_lossy().starts_with(id) {
+                text = std::fs::read_to_string(e.path()).ok();
+            }
+            let _ = std::fs::remove_file(e.path());
+        }
+        text
+    }
+
+    /// YouTube search results as (id, title, seconds).
+    pub async fn search_videos(&self, query: &str) -> Vec<(String, String, Option<u32>)> {
+        self.wait_for_tools().await;
+        let Ok(_permit) = self.procs.acquire().await else { return Vec::new() };
+        let Ok(mut cmd) = self.command(Quality::Compatible) else { return Vec::new() };
+        let run = cmd
+            .args(["--flat-playlist", "--print", "%(id)s\t%(duration)s\t%(title)s"])
+            .arg(format!("ytsearch5:{query}"))
+            .output();
+        let Ok(Ok(out)) = tokio::time::timeout(CAPTIONS_TIMEOUT, run).await else { return Vec::new() };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let mut p = l.splitn(3, '\t');
+                let (id, secs, title) = (p.next()?, p.next()?, p.next()?);
+                Some((id.to_owned(), title.to_owned(), secs.parse::<f64>().ok().map(|s| s as u32)))
+            })
+            .collect()
     }
 
     async fn download_resolved(&self, resolved: &Resolved, stem: &str) -> Result<PathBuf> {
