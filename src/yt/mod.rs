@@ -3,7 +3,9 @@
 
 pub mod browse;
 pub mod lyrics;
+pub mod version;
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::RwLock;
 
@@ -39,6 +41,8 @@ pub struct Yt {
     region: RwLock<String>,
     /// Look up synced lyrics on LRCLIB (sends title/artist there).
     pub use_lrclib: std::sync::atomic::AtomicBool,
+    /// Song found for a music video (None: there is none), by video id.
+    song_versions: std::sync::Mutex<HashMap<String, Option<Item>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,6 +108,7 @@ impl Yt {
             cookie,
             region: RwLock::new("US".into()),
             use_lrclib: std::sync::atomic::AtomicBool::new(true),
+            song_versions: Default::default(),
         })
     }
 
@@ -829,6 +834,32 @@ impl Yt {
         Ok(out)
     }
 
+    /// The official song for a music video, when YouTube Music has one that is
+    /// the same title, artist and kind of version (see `version`). Errors
+    /// count as "none" so playback never waits on a retry loop.
+    pub async fn song_version(&self, video: &Item) -> Option<Item> {
+        const MAX_KEPT: usize = 2000;
+        if video.kind != Kind::Video || video.artists.is_empty() {
+            return None;
+        }
+        if let Some(hit) = self.song_versions.lock().unwrap().get(&video.id) {
+            return hit.clone();
+        }
+        let artist = video.artists.first().map(|a| a.name.as_str()).unwrap_or_default();
+        let query = format!("{} {artist}", video.title);
+        let songs: Vec<Item> = match self.q().music_search_tracks(&query).await {
+            Ok(r) => r.items.items.iter().take(10).map(track_item).collect(),
+            Err(_) => return None,
+        };
+        let found = version::pick_song(video, &songs);
+        let mut kept = self.song_versions.lock().unwrap();
+        if kept.len() >= MAX_KEPT {
+            kept.clear();
+        }
+        kept.insert(video.id.clone(), found.clone());
+        found
+    }
+
     /// Metadata for a single track.
     pub async fn track(&self, video_id: &str) -> Result<Item> {
         Ok(track_item(&self.q().music_details(video_id).await?.track))
@@ -1083,6 +1114,33 @@ mod network_tests {
         println!("source {}", l.source);
         assert!(matches!(l.body, lyrics::LyricsBody::Synced(_)));
         assert_eq!(l.source, "LyricFind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Music videos in a radio are matched to their official songs:
+    /// `cargo test --bins -- --ignored song_versions --nocapture`
+    /// (YUSIC_SEED picks the radio's first song).
+    #[tokio::test]
+    #[ignore]
+    async fn song_versions_match() {
+        let dir = std::env::temp_dir().join(format!("yusic-versions-{}", std::process::id()));
+        let yt = Yt::new(&dir, reqwest::Client::new()).unwrap();
+        // The AMA live performance of "Monster", named just "Monster".
+        let live = yt.track("ZXgvZZxoitc").await.unwrap();
+        let song = yt.song_version(&live).await.expect("the studio song");
+        assert_eq!(song.kind, Kind::Song);
+        println!("{} -> {} {} [{:?}]", live.title, song.id, song.title, song.album.map(|a| a.name));
+        let seed = std::env::var("YUSIC_SEED").unwrap_or("0KXQ9eQxnuU".into());
+        let (items, _) = yt.radio(&seed).await.unwrap();
+        let (mut swapped, mut videos) = (0, 0);
+        for i in items.iter().filter(|i| i.kind == Kind::Video).take(40) {
+            videos += 1;
+            let s = yt.song_version(i).await;
+            swapped += s.is_some() as usize;
+            let to = s.map(|s| format!("{} {} [{}]", s.id, s.title, s.album.map(|a| a.name).unwrap_or_default()));
+            println!("{} | {} | {} -> {}", i.id, i.title, i.artist_names(), to.as_deref().unwrap_or("kept"));
+        }
+        println!("{swapped} of {videos} videos have a song version");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

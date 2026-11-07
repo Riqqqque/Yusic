@@ -40,6 +40,9 @@ pub struct Settings {
     pub always_shuffle: bool,
     /// Let autoplay learn from what's finished and what's skipped.
     pub smart_autoplay: bool,
+    /// Play the official song instead of a music video of it (YouTube Music
+    /// names many live and acoustic videos with the plain song title).
+    pub prefer_songs: bool,
 }
 
 impl Default for Settings {
@@ -65,6 +68,7 @@ impl Default for Settings {
             artist_play: "shuffle".into(),
             always_shuffle: false,
             smart_autoplay: true,
+            prefer_songs: true,
         }
     }
 }

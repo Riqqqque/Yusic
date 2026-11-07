@@ -211,6 +211,17 @@ component SettingsView inherits Rectangle {
                 }
 
                 SettingRow {
+                    title: "Play songs instead of videos";
+                    detail: "Plays the official song when YouTube Music offers a music video of it. Many live and acoustic videos carry the plain song title; with this on, what you hear matches the song shown. Versions named as such, like \"(Acoustic)\", play as named.";
+                    Toggle {
+                        checked: root.settings.prefer-songs;
+                        toggled(on) => {
+                            Bridge.setting("prefer-songs", on ? "1" : "0");
+                        }
+                    }
+                }
+
+                SettingRow {
                     title: "Always shuffle";
                     detail: "Shuffles albums, playlists and artists whenever you play them. Tap shuffle in the player to switch back to the original order.";
                     Toggle {

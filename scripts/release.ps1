@@ -50,7 +50,11 @@ try {
     if ($DryRun) { return }
     if (-not $Notes) { $Notes = "Yusic $Version" }
     $Notes += "`n`nSHA-256 of Yusic.exe: ``$hash``"
-    gh release create "v$Version" $out --title "Yusic $Version" --notes $Notes
+    # Windows PowerShell splits a native argument at embedded double quotes,
+    # so the notes go through a file.
+    $notesFile = Join-Path $env:CARGO_TARGET_DIR 'release-notes.md'
+    [IO.File]::WriteAllText($notesFile, $Notes, (New-Object Text.UTF8Encoding $false))
+    gh release create "v$Version" $out --title "Yusic $Version" --notes-file $notesFile
     if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
 } finally {
     Pop-Location

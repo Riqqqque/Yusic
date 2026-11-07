@@ -122,6 +122,9 @@ struct State {
     queue_orig: Vec<String>,
     /// Songs that came from radio or autoplay (not picked by the user).
     autoplay_ids: HashSet<String>,
+    /// Music videos already checked for an official song, and lookups running.
+    versions_checked: HashSet<String>,
+    versions_pending: HashSet<String>,
     /// Radio/autoplay songs skipped early in a row.
     autoplay_skips: u32,
     /// The last song the user listened to most of.
@@ -200,6 +203,30 @@ impl State {
                 self.queue.push(it);
             }
         }
+    }
+
+    /// Puts the official song where a music video of it is queued. The
+    /// playlist entry id stays, so the row can still be removed.
+    fn swap_version(&mut self, video_id: &str, song: &Item) -> bool {
+        let mut changed = false;
+        for q in self.queue.iter_mut().filter(|q| q.id == video_id) {
+            let set_video_id = q.set_video_id.take();
+            *q = Item { set_video_id, ..song.clone() };
+            changed = true;
+        }
+        for id in self.queue_orig.iter_mut().filter(|i| *i == video_id) {
+            *id = song.id.clone();
+        }
+        if self.autoplay_ids.remove(video_id) {
+            self.autoplay_ids.insert(song.id.clone());
+        }
+        changed
+    }
+
+    /// Autoplay should continue in the kind of version being played: when it
+    /// isn't a named live/acoustic/cover version, such videos are left out.
+    fn keeps_versions(&self, prefer_songs: bool) -> bool {
+        !prefer_songs || self.current().is_some_and(|c| !crate::yt::version::marks(&c.title).is_empty())
     }
 
     fn prune_downloads(&mut self, keep: &[&str]) {
@@ -1067,7 +1094,8 @@ impl App {
                             return;
                         };
                         // Songs queued meanwhile stay; the radio goes after them.
-                        st.push_autoplay(app.taste_filter(items));
+                        let keep = st.keeps_versions(app.settings.borrow().prefer_songs);
+                        st.push_autoplay(app.taste_filter(version_filter(items, keep)));
                         st.radio_more = more;
                     }
                     app.refresh_queue();
@@ -1146,7 +1174,8 @@ impl App {
                         app.radio_failed();
                         return;
                     };
-                    st.push_autoplay(app.taste_filter(items));
+                    let keep = st.keeps_versions(app.settings.borrow().prefer_songs);
+                        st.push_autoplay(app.taste_filter(version_filter(items, keep)));
                     st.radio_more = more;
                 }
                 app.refresh_queue();
@@ -1313,6 +1342,15 @@ impl App {
             let Some(item) = st.current().cloned() else { return };
             let next = st.next_id();
             st.pending_advance = false;
+            if self.needs_version_check(&st, &item) {
+                // Find the song first, so a live video named like the song
+                // never starts playing in its place.
+                let tok = st.play_gen;
+                drop(st);
+                self.player.clear();
+                self.ui().set_buffering(true);
+                return self.check_version(item, Some(tok));
+            }
             // An early lookup for another song would compete with this one.
             if st.warming.as_ref().is_some_and(|(w, _)| *w != item.id) {
                 if let Some((_, h)) = st.warming.take() {
@@ -1398,20 +1436,72 @@ impl App {
         self.prefetch_next();
     }
 
+    fn needs_version_check(&self, st: &State, item: &Item) -> bool {
+        self.settings.borrow().prefer_songs
+            && item.kind == Kind::Video
+            && !item.artists.is_empty()
+            && !st.versions_checked.contains(&item.id)
+    }
+
+    /// Looks for the official song of a queued music video and swaps it in.
+    /// `tok`: the play request waiting on it (None: preparing the next song).
+    fn check_version(self: &Rc<Self>, item: Item, tok: Option<u64>) {
+        {
+            let mut st = self.st.borrow_mut();
+            if !st.versions_pending.insert(item.id.clone()) && tok.is_none() {
+                return;
+            }
+        }
+        let yt = self.yt.clone();
+        let video = item.clone();
+        self.spawn(async move { yt.song_version(&video).await }, move |app, song| {
+            let changed = {
+                let mut st = app.st.borrow_mut();
+                st.versions_pending.remove(&item.id);
+                st.versions_checked.insert(item.id.clone());
+                match &song {
+                    Some(s) => {
+                        st.versions_checked.insert(s.id.clone());
+                        st.swap_version(&item.id, s)
+                    }
+                    None => false,
+                }
+            };
+            if changed {
+                app.refresh_queue();
+            }
+            let (play_gen, now_current) = {
+                let st = app.st.borrow();
+                (st.play_gen, changed && st.current().zip(song.as_ref()).is_some_and(|(c, s)| c.id == s.id))
+            };
+            match tok {
+                Some(t) if t == play_gen => app.start_current(),
+                Some(_) => {}
+                // The song a playing video was swapped for (its details came late).
+                None if now_current => app.start_current(),
+                None => app.prefetch_next(),
+            }
+        });
+    }
+
     /// Looks up title/artist/art for a track queued by id only.
     fn fill_metadata(self: &Rc<Self>, id: &str) {
         let yt = self.yt.clone();
         let vid = id.to_owned();
         self.spawn(async move { yt.track(&vid).await.ok() }, move |app, item| {
             let Some(item) = item else { return };
-            let is_current = {
+            let (is_current, check) = {
                 let mut st = app.st.borrow_mut();
                 for q in st.queue.iter_mut().filter(|q| q.id == item.id) {
                     *q = item.clone();
                 }
-                st.current().is_some_and(|c| c.id == item.id)
+                let is_current = st.current().is_some_and(|c| c.id == item.id);
+                (is_current, is_current && app.needs_version_check(&st, &item))
             };
             app.refresh_queue();
+            if check {
+                app.check_version(item.clone(), None);
+            }
             if is_current {
                 let ui = app.ui();
                 let mut now = ui.get_now();
@@ -1507,6 +1597,12 @@ impl App {
         let Some(next) = next.filter(|n| Some(n) != cur.as_ref()) else { return };
         if st.downloads.iter().any(|(id, _)| *id == next) {
             return;
+        }
+        if let Some(item) = st.next_index().map(|i| st.queue[i].clone()) {
+            if self.needs_version_check(&st, &item) {
+                drop(st);
+                return self.check_version(item, None);
+            }
         }
         let res = self.res.clone();
         let cookie = self.yt.cookie();
@@ -1648,7 +1744,8 @@ impl App {
                     app.radio_failed();
                     return;
                 };
-                st.push_autoplay(app.taste_filter(items));
+                let keep = st.keeps_versions(app.settings.borrow().prefer_songs);
+                        st.push_autoplay(app.taste_filter(version_filter(items, keep)));
                 st.radio_more = more;
             }
             app.refresh_queue();
@@ -2578,6 +2675,21 @@ fn set_active(model: &Rc<VecModel<TrackData>>, id: &str) {
     }
 }
 
+
+/// Leaves music videos named as another version (live, acoustic, covers)
+/// out of autoplay, unless that would leave nothing.
+fn version_filter(items: Vec<Item>, keep_versions: bool) -> Vec<Item> {
+    if keep_versions {
+        return items;
+    }
+    let kept: Vec<Item> = items
+        .iter()
+        .filter(|i| i.kind != Kind::Video || crate::yt::version::marks(&i.title).is_empty())
+        .cloned()
+        .collect();
+    if kept.is_empty() { items } else { kept }
+}
+
 #[cfg(test)]
 mod link_tests {
     use super::*;
@@ -2731,5 +2843,40 @@ mod lyric_check_tests {
         }
         println!("changed {changed}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod version_swap_tests {
+    use super::*;
+
+    fn item(kind: Kind, id: &str, title: &str) -> Item {
+        Item { kind, id: id.into(), title: title.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn the_song_takes_the_videos_place() {
+        let mut st = State::default();
+        let mut video = item(Kind::Video, "v", "Monster");
+        video.set_video_id = Some("row".into());
+        st.push_autoplay(vec![item(Kind::Song, "a", "A"), video, item(Kind::Song, "b", "B")]);
+        assert!(st.swap_version("v", &item(Kind::Song, "s", "Monster")));
+        assert_eq!(st.queue[1].id, "s");
+        assert_eq!(st.queue[1].kind, Kind::Song);
+        assert_eq!(st.queue[1].set_video_id.as_deref(), Some("row"));
+        assert_eq!(st.queue_orig, ["a", "s", "b"]);
+        assert!(st.autoplay_ids.contains("s") && !st.autoplay_ids.contains("v"));
+    }
+
+    #[test]
+    fn autoplay_leaves_out_named_versions() {
+        let items = vec![
+            item(Kind::Video, "1", "God Is A Woman in the Live Lounge"),
+            item(Kind::Video, "2", "Monster"),
+            item(Kind::Song, "3", "2002 (Acoustic)"),
+        ];
+        let ids = |v: Vec<Item>| v.into_iter().map(|i| i.id).collect::<Vec<_>>();
+        assert_eq!(ids(version_filter(items.clone(), false)), ["2", "3"]);
+        assert_eq!(ids(version_filter(items, true)), ["1", "2", "3"]);
     }
 }

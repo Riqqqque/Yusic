@@ -104,6 +104,7 @@ impl App {
             artist_play: s.artist_play.as_str().into(),
             always_shuffle: s.always_shuffle,
             smart_autoplay: s.smart_autoplay,
+            prefer_songs: s.prefer_songs,
             version: env!("CARGO_PKG_VERSION").into(),
             installed: crate::install::is_installed_copy(),
         }
@@ -144,6 +145,7 @@ impl App {
                 "artist-play" => s.artist_play = value.into(),
                 "always-shuffle" => s.always_shuffle = on,
                 "smart-autoplay" => s.smart_autoplay = on,
+                "prefer-songs" => s.prefer_songs = on,
                 _ => return,
             }
         }
